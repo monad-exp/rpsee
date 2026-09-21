@@ -75,7 +75,7 @@ The image workflow builds pull requests and publishes pushes to `master`, `main`
 
 ## License
 
-The existing upstream GPL v2 license is preserved in [LICENSE-v1.md](https://github.com/QEDK/rpsee/blob/HEAD/LICENSE-v1.md). Monad Foundation contributions are licensed under GPL v3 as set out in [LICENSE](https://github.com/QEDK/rpsee/blob/HEAD/LICENSE). The additional license applies to those contributions and does not relicense upstream code.
+The existing upstream GPL v2 license is preserved in [LICENSE-v1.md](https://github.com/monad-exp/rpsee/blob/HEAD/LICENSE-v1.md). Monad Foundation contributions are licensed under GPL v3 as set out in [LICENSE](https://github.com/monad-exp/rpsee/blob/HEAD/LICENSE). The additional license applies to those contributions and does not relicense upstream code.
 
 ## Acknowledgements
 

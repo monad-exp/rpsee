@@ -7,8 +7,8 @@ authors = ["makemake <vukasin@gostovic.me>, Rainshower Labs, contributors", "Mon
 license-file = "LICENSE"
 description = "Fast, minimalist load balancing with caching for Ethereum JSON-RPC calls. Full support for HTTP and WS."
 readme = "README.md"
-homepage = "https://github.com/QEDK/rpsee"
-repository = "https://github.com/QEDK/rpsee"
+homepage = "https://github.com/monad-exp/rpsee"
+repository = "https://github.com/monad-exp/rpsee"
 keywords = ["cli", "ethereum", "load-balancing", "websocket", "http"]
 categories = ["command-line-utilities"]
 

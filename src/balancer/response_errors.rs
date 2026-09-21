@@ -34,7 +34,7 @@ macro_rules! print_cache_error {
             "To recover, please stop rpsee, delete your cache folder, and start rpsee again."
         );
         tracing::error!(
-            "If the error perists, please open up an issue: https://github.com/QEDK/rpsee/issues"
+            "If the error perists, please open up an issue: https://github.com/monad-exp/rpsee/issues"
         );
     };
 }
