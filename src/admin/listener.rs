@@ -1,37 +1,20 @@
 use std::{
     net::SocketAddr,
-    sync::{
-        Arc,
-        RwLock,
-    },
+    sync::{Arc, RwLock},
 };
 
 use crate::{
+    Rpc, Settings,
     admin::{
         accept::accept_admin_request,
-        liveready::{
-            liveness_monitor,
-            LiveReadyRequestSnd,
-            LiveReadyUpdateRecv,
-        },
+        liveready::{LiveReadyRequestSnd, LiveReadyUpdateRecv, liveness_monitor},
     },
-    database::types::{
-        GenericBytes,
-        RequestBus,
-    },
-    Rpc,
-    Settings,
+    database::types::{GenericBytes, RequestBus},
 };
 
-use hyper::{
-    server::conn::http1,
-    service::service_fn,
-};
-use hyper_util_blutgang::rt::TokioIo;
-use tokio::{
-    net::TcpListener,
-    sync::mpsc,
-};
+use hyper::{server::conn::http1, service::service_fn};
+use hyper_util::rt::TokioIo;
+use tokio::{net::TcpListener, sync::mpsc};
 
 macro_rules! accept_admin {
     (
@@ -131,7 +114,7 @@ where
         address = config_guard.admin.address;
     }
 
-    // Spawn thread for monitoring the current liveness status of Blutgang
+    // Spawn thread for monitoring the current liveness status of Rpsee
     let (liveness_request_tx, liveness_request_rx) = mpsc::channel(16);
     tokio::spawn(liveness_monitor(liveness_receiver, liveness_request_rx));
 

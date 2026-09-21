@@ -1,15 +1,9 @@
-use crate::rpc::{
-    error::RpcError,
-    method::EthRpcMethod,
-};
+use crate::rpc::{error::RpcError, method::EthRpcMethod};
 use reqwest::Client;
 use rust_tracing::deps::metrics;
 use url::Url;
 
-use serde_json::{
-    json,
-    Value,
-};
+use serde_json::{Value, json};
 
 // All as floats so we have an easier time getting averages, stats and terminology copied from flood.
 #[derive(Debug, Clone, Default)]
@@ -36,16 +30,25 @@ pub struct Rpc {
     pub status: Status,           // stores stats related to the rpc.
     // For max_consecutive
     pub max_consecutive: u32, // max times we can call an rpc in a row
+    #[cfg_attr(feature = "selection-random", allow(dead_code))]
     pub consecutive: u32,
     // For max_per_second
-    pub last_used: u128,      // last time we sent a query to this node
+    #[cfg_attr(
+        any(feature = "selection-random", feature = "old-weighted-round-robin"),
+        allow(dead_code)
+    )]
+    pub last_used: u128, // last time we sent a query to this node
+    #[cfg_attr(
+        any(feature = "selection-random", feature = "old-weighted-round-robin"),
+        allow(dead_code)
+    )]
     pub min_time_delta: u128, // microseconds
 }
 
 /// Sanitizes URLs so secrets don't get outputed.
 ///
-/// For example, if we have a URL: https://eth-mainnet.g.alchemy.com/v2/api-key
-// as input, we output: https://eth-mainnet.g.alchemy.com/
+/// For example, `https://eth-mainnet.g.alchemy.com/v2/api-key` becomes
+/// `https://eth-mainnet.g.alchemy.com/`.
 fn sanitize_url(url: &url::Url) -> Result<String, url::ParseError> {
     // Build a new URL with the scheme, host, and port (if any), but without the path or query
     let sanitized = Url::parse(&format!(
@@ -137,13 +140,13 @@ impl Rpc {
         metrics::counter!("rpc_requests_total", "method" => method.as_str()).increment(1);
 
         let req_start = std::time::Instant::now();
-        let number = self.send_request(request).await?;
+        let number = self.send_request(request).await;
 
         metrics::histogram!("rpc_response_time_secs", "method" => method.as_str())
             .record(req_start.elapsed().as_secs_f64());
         metrics::gauge!("rpc_requests_active", "method" => method.as_str()).decrement(1);
 
-        let return_number = extract_number(&number)?;
+        let return_number = extract_number(&number?)?;
 
         Ok(return_number)
     }
@@ -162,13 +165,13 @@ impl Rpc {
         metrics::counter!("rpc_requests_total", "method" => method.as_str()).increment(1);
 
         let req_start = std::time::Instant::now();
-        let sync = self.send_request(request).await?;
+        let sync = self.send_request(request).await;
 
         metrics::histogram!("rpc_response_time_secs", "method" => method.as_str())
             .record(req_start.elapsed().as_secs_f64());
         metrics::gauge!("rpc_requests_active", "method" => method.as_str()).decrement(1);
 
-        let status = extract_sync(&sync)?;
+        let status = extract_sync(&sync?)?;
 
         Ok(status)
     }
@@ -187,13 +190,13 @@ impl Rpc {
         metrics::counter!("rpc_requests_total", "method" => method.as_str()).increment(1);
 
         let req_start = std::time::Instant::now();
-        let mut resp = self.send_request(request).await?;
+        let resp = self.send_request(request).await;
 
         metrics::histogram!("rpc_response_time_secs", "method" => method.as_str())
             .record(req_start.elapsed().as_secs_f64());
         metrics::gauge!("rpc_requests_active", "method" => method.as_str()).decrement(1);
 
-        let number: Value = unsafe { simd_json::serde::from_str(&mut resp)? };
+        let number: Value = simd_json::serde::from_slice(&mut resp?.into_bytes())?;
         let number = &number["result"]["number"];
 
         let number = match number.as_str() {
@@ -201,7 +204,7 @@ impl Rpc {
             None => {
                 return Err(RpcError::InvalidResponse(
                     "error: Can't get finalized block!".to_string(),
-                ))
+                ));
             }
         };
 
@@ -217,7 +220,7 @@ impl Rpc {
     /// We don't do it within send_request because we might kill it if it times out.
     pub fn update_latency(&mut self, latest: f64) {
         // If we have data >= to ma_length, remove the first one in line
-        if self.status.latency_data.len() >= self.status.ma_length as usize {
+        if self.status.latency_data.len() >= (self.status.ma_length as usize).max(1) {
             self.status.latency_data.remove(0);
         }
 
@@ -230,9 +233,9 @@ impl Rpc {
 
 /// Parses the result of `eth_syncing` and returns the status as a bool.
 fn extract_sync(rx: &str) -> Result<bool, RpcError> {
-    let mut rx = rx.to_string();
+    let mut rx = rx.as_bytes().to_vec();
 
-    let json: Value = unsafe { simd_json::serde::from_str(&mut rx)? };
+    let json: Value = simd_json::serde::from_slice(&mut rx)?;
 
     let result = &json["result"];
 
@@ -251,21 +254,20 @@ fn extract_sync(rx: &str) -> Result<bool, RpcError> {
 
 /// Take in the result of `eth_getBlockByNumber`, and extract the block number
 fn extract_number(rx: &str) -> Result<u64, RpcError> {
-    let mut rx = rx.to_string();
+    let mut rx = rx.as_bytes().to_vec();
 
-    let json: Value = unsafe { simd_json::serde::from_str(&mut rx)? };
+    let json: Value = simd_json::serde::from_slice(&mut rx)?;
 
     let number = match json["result"].as_str() {
         Some(number) => number,
         None => {
             return Err(RpcError::InvalidResponse(
                 "error: Extracting response from request failed!".to_string(),
-            ))
+            ));
         }
     };
 
-    let number = hex_to_decimal(number).unwrap();
-    Ok(number)
+    hex_to_decimal(number).map_err(|err| RpcError::InvalidResponse(err.to_string()))
 }
 
 pub fn hex_to_decimal(hex_string: &str) -> Result<u64, std::num::ParseIntError> {
@@ -286,6 +288,22 @@ mod tests {
     use simd_json::serde::to_string;
 
     #[test]
+    fn invalid_block_number_is_an_error() {
+        for number in ["0xnope", "0x10000000000000000", ""] {
+            assert!(extract_number(&json!({"result": number}).to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn default_rpc_records_latency() {
+        let mut rpc = Rpc::default();
+        rpc.update_latency(10.0);
+        rpc.update_latency(20.0);
+        assert_eq!(rpc.status.latency, 20.0);
+        assert_eq!(rpc.status.latency_data, vec![20.0]);
+    }
+
+    #[test]
     fn test_extract_sync_syncing() {
         let input = json!({
             "id": 1,
@@ -298,7 +316,7 @@ mod tests {
         });
         let input_str = to_string(&input).unwrap();
         let result = extract_sync(&input_str);
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -310,7 +328,7 @@ mod tests {
         });
         let input_str = to_string(&input).unwrap();
         let result = extract_sync(&input_str);
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[test]

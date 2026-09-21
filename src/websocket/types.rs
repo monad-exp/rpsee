@@ -1,12 +1,6 @@
 use std::{
-    collections::{
-        HashMap,
-        HashSet,
-    },
-    sync::{
-        Arc,
-        RwLock,
-    },
+    collections::{HashMap, HashSet},
+    sync::{Arc, RwLock},
 };
 
 use crate::websocket::error::WsError;
@@ -232,7 +226,7 @@ impl SubscriptionData {
             .unwrap_or_else(|e| e.into_inner());
 
         // Directly unsubscribing the user within the loop
-        for (_, subscribers) in subscriptions.iter_mut() {
+        for subscribers in subscriptions.values_mut() {
             if subscribers.contains(&user_id) {
                 subscribers.remove(&user_id);
                 metrics::gauge!("ws_user_subs_total").decrement(1);
@@ -266,8 +260,8 @@ impl SubscriptionData {
             .unwrap_or_else(|e| e.into_inner());
 
         incoming_subscriptions
-            .iter()
-            .filter_map(|(_, node_sub_info)| {
+            .values()
+            .filter_map(|node_sub_info| {
                 if node_sub_info.node_id == node_id {
                     Some(node_sub_info.subscription_id.to_owned())
                 } else {
@@ -436,17 +430,21 @@ mod tests {
     async fn test_add_and_remove_user() {
         let (subscription_data, user_id, _) = setup_user_and_subscription_data();
 
-        assert!(subscription_data
-            .users
-            .read()
-            .unwrap()
-            .contains_key(&user_id));
+        assert!(
+            subscription_data
+                .users
+                .read()
+                .unwrap()
+                .contains_key(&user_id)
+        );
         subscription_data.remove_user(user_id);
-        assert!(!subscription_data
-            .users
-            .read()
-            .unwrap()
-            .contains_key(&user_id));
+        assert!(
+            !subscription_data
+                .users
+                .read()
+                .unwrap()
+                .contains_key(&user_id)
+        );
     }
 
     #[tokio::test]
@@ -495,24 +493,32 @@ mod tests {
         subscription_data
             .subscribe_user(user_id, subscription_request.clone())
             .unwrap();
-        assert!(subscription_data
-            .subscriptions
-            .read()
-            .unwrap()
-            .iter()
-            .any(|(k, v)| {
-                k.node_id == node_id && k.subscription_id == subscription_id && v.contains(&user_id)
-            }));
+        assert!(
+            subscription_data
+                .subscriptions
+                .read()
+                .unwrap()
+                .iter()
+                .any(|(k, v)| {
+                    k.node_id == node_id
+                        && k.subscription_id == subscription_id
+                        && v.contains(&user_id)
+                })
+        );
 
         subscription_data.unsubscribe_user(user_id, subscription_id.clone());
-        assert!(!subscription_data
-            .subscriptions
-            .read()
-            .unwrap()
-            .iter()
-            .any(|(k, v)| {
-                k.node_id == node_id && k.subscription_id == subscription_id && v.contains(&user_id)
-            }));
+        assert!(
+            !subscription_data
+                .subscriptions
+                .read()
+                .unwrap()
+                .iter()
+                .any(|(k, v)| {
+                    k.node_id == node_id
+                        && k.subscription_id == subscription_id
+                        && v.contains(&user_id)
+                })
+        );
     }
 
     #[tokio::test]
@@ -530,24 +536,32 @@ mod tests {
         subscription_data
             .subscribe_user(user_id, subscription_request.clone())
             .unwrap();
-        assert!(subscription_data
-            .subscriptions
-            .read()
-            .unwrap()
-            .iter()
-            .any(|(k, v)| {
-                k.node_id == node_id && k.subscription_id == subscription_id && v.contains(&user_id)
-            }));
+        assert!(
+            subscription_data
+                .subscriptions
+                .read()
+                .unwrap()
+                .iter()
+                .any(|(k, v)| {
+                    k.node_id == node_id
+                        && k.subscription_id == subscription_id
+                        && v.contains(&user_id)
+                })
+        );
 
         subscription_data.unsubscribe_user_from_all(user_id);
-        assert!(!subscription_data
-            .subscriptions
-            .read()
-            .unwrap()
-            .iter()
-            .any(|(k, v)| {
-                k.node_id == node_id && k.subscription_id == subscription_id && v.contains(&user_id)
-            }));
+        assert!(
+            !subscription_data
+                .subscriptions
+                .read()
+                .unwrap()
+                .iter()
+                .any(|(k, v)| {
+                    k.node_id == node_id
+                        && k.subscription_id == subscription_id
+                        && v.contains(&user_id)
+                })
+        );
     }
 
     #[tokio::test]
@@ -583,17 +597,21 @@ mod tests {
         let (subscription_data, _, _) = setup_user_and_subscription_data();
         let non_existent_user_id = 999;
 
-        assert!(!subscription_data
-            .users
-            .read()
-            .unwrap()
-            .contains_key(&non_existent_user_id));
+        assert!(
+            !subscription_data
+                .users
+                .read()
+                .unwrap()
+                .contains_key(&non_existent_user_id)
+        );
         subscription_data.remove_user(non_existent_user_id);
-        assert!(!subscription_data
-            .users
-            .read()
-            .unwrap()
-            .contains_key(&non_existent_user_id));
+        assert!(
+            !subscription_data
+                .users
+                .read()
+                .unwrap()
+                .contains_key(&non_existent_user_id)
+        );
     }
 
     #[tokio::test]
@@ -608,12 +626,14 @@ mod tests {
         };
 
         subscription_data.unsubscribe_user(user_id, nonexistent_subscription_id.clone());
-        assert!(subscription_data
-            .subscriptions
-            .read()
-            .unwrap()
-            .get(&nonexistent_node_sub_info)
-            .is_none());
+        assert!(
+            subscription_data
+                .subscriptions
+                .read()
+                .unwrap()
+                .get(&nonexistent_node_sub_info)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -770,13 +790,15 @@ mod tests {
             .subscribe_user(user_id, subscription_request)
             .unwrap();
 
-        assert!(subscription_data
-            .move_subscriptions(
-                target_node_id,
-                r#"["oldHeads"]"#.to_string(),
-                subscription_id.clone()
-            )
-            .is_ok());
+        assert!(
+            subscription_data
+                .move_subscriptions(
+                    target_node_id,
+                    r#"["oldHeads"]"#.to_string(),
+                    subscription_id.clone()
+                )
+                .is_ok()
+        );
 
         // Check if user is subscribed to the new node
         let subscriptions = subscription_data.subscriptions.read().unwrap();
@@ -784,10 +806,12 @@ mod tests {
             node_id: target_node_id,
             subscription_id,
         };
-        assert!(subscriptions
-            .get(&node_sub_info)
-            .unwrap()
-            .contains(&user_id));
+        assert!(
+            subscriptions
+                .get(&node_sub_info)
+                .unwrap()
+                .contains(&user_id)
+        );
 
         // Check if subscription has been moved from the old node
         let old_node_sub_info = NodeSubInfo {
@@ -811,13 +835,15 @@ mod tests {
             source_node_id,
         );
 
-        assert!(subscription_data
-            .move_subscriptions(
-                target_node_id,
-                subscription_request.clone(),
-                subscription_id.clone()
-            )
-            .is_err());
+        assert!(
+            subscription_data
+                .move_subscriptions(
+                    target_node_id,
+                    subscription_request.clone(),
+                    subscription_id.clone()
+                )
+                .is_err()
+        );
 
         // Check if the subscription exists for the target node
         let incoming_subscriptions = subscription_data.incoming_subscriptions.read().unwrap();
@@ -826,8 +852,8 @@ mod tests {
         // Ensure there are no subscribers to the moved subscription
         let subscriptions = subscription_data.subscriptions.read().unwrap();
         assert!(
-            subscriptions.get(&node_sub_info).is_none()
-                || subscriptions.get(&node_sub_info).unwrap().is_empty()
+            subscriptions.get(node_sub_info).is_none()
+                || subscriptions.get(node_sub_info).unwrap().is_empty()
         );
     }
 

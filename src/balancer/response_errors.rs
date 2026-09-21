@@ -1,14 +1,13 @@
-//! Due to how schizophrenic hyper is, we're defining our http errors like this.
-//! ???
+//! HTTP responses for proxy failures.
 
 #[macro_export]
 macro_rules! no_rpc_available {
-    () => {
+    ($id:expr) => {
         Ok(hyper::Response::builder()
             .status(500)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(
-                "{code:-32002, message:\"error: No working RPC available! Try again later...\"}"
-                    .to_string(),
+                serde_json::json!({"jsonrpc":"2.0", "id":$id, "error":{"code":-32002, "message":"No working RPC available"}}).to_string(),
             )))
             .unwrap())
     };
@@ -16,12 +15,12 @@ macro_rules! no_rpc_available {
 
 #[macro_export]
 macro_rules! timed_out {
-    () => {
+    ($id:expr) => {
         Ok(hyper::Response::builder()
             .status(408)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(
-                "{code:-32001, message:\"error: Request timed out! Try again later...\"}"
-                    .to_string(),
+                serde_json::json!({"jsonrpc":"2.0", "id":$id, "error":{"code":-32001, "message":"Request timed out"}}).to_string(),
             )))
             .unwrap())
     };
@@ -31,18 +30,23 @@ macro_rules! timed_out {
 macro_rules! print_cache_error {
     () => {
         tracing::error!("!!! Cache error! Check the DB !!!");
-        tracing::error!("To recover, please stop blutgang, delete your cache folder, and start blutgang again.");
-        tracing::error!("If the error perists, please open up an issue: https://github.com/rainshowerLabs/blutgang/issues");
+        tracing::error!(
+            "To recover, please stop rpsee, delete your cache folder, and start rpsee again."
+        );
+        tracing::error!(
+            "If the error perists, please open up an issue: https://github.com/QEDK/rpsee/issues"
+        );
     };
 }
 
 #[macro_export]
 macro_rules! cache_error {
-    () => {
+    ($id:expr) => {
         Ok(hyper::Response::builder()
             .status(500)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(
-                "{code:-32003, message:\"error: Cache error! Try again later...\"}".to_string(),
+                serde_json::json!({"jsonrpc":"2.0", "id":$id, "error":{"code":-32003, "message":"Cache error"}}).to_string(),
             )))
             .unwrap())
     };

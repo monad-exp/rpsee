@@ -1,7 +1,11 @@
 /target
+/.git
 /.venv
-/blutgang-cache
+/rpsee-cache*
+/default.sled
+/db
 /benchmarks.txt
 /config.toml
+/rpsee-admin.toml
 /.DS_Store
-/config.toml
+/.env

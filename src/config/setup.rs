@@ -1,8 +1,4 @@
-use crate::{
-    config::error::ConfigError,
-    rpc::error::RpcError,
-    Rpc,
-};
+use crate::{Rpc, config::error::ConfigError, rpc::error::RpcError};
 use std::time::Instant;
 use tokio::sync::mpsc;
 

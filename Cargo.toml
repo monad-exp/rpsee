@@ -1,32 +1,33 @@
 [package]
-name = "blutgang"
+name = "rpsee"
 version = "0.3.6"
-edition = "2021"
-authors = ["makemake <vukasin@gostovic.me>, Rainshower Labs, contributors"]
+edition = "2024"
+rust-version = "1.98.1"
+authors = ["makemake <vukasin@gostovic.me>, Rainshower Labs, contributors", "Monad Foundation"]
 license-file = "LICENSE"
 description = "Fast, minimalist load balancing with caching for Ethereum JSON-RPC calls. Full support for HTTP and WS."
 readme = "README.md"
-homepage = "https://github.com/rainshowerLabs/blutgang"
-repository = "https://github.com/rainshowerLabs/blutgang"
+homepage = "https://github.com/QEDK/rpsee"
+repository = "https://github.com/QEDK/rpsee"
 keywords = ["cli", "ethereum", "load-balancing", "websocket", "http"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-blake3 = "1.4.1"
-chrono = "0.4.28"
-clap = { version = "4.5", features = ["derive", "env"] }
-codespan-reporting = "0.12"
-futures = "0.3.29"
-futures-util = "0.3.29"
-http-body-util = "0.1.0-rc.3"
-hyper = { version = "1.4.1", features = ["server", "http1"] }
-hyper-tungstenite = "0.12.0"
-hyper-util-blutgang = { version = "0.2.0", features = ["tokio"] }
-jsonwebtoken = "9.1.0"
-memchr = "2.5.0"
-rand = { version = "0.8.5" }
-reqwest = { version = "0.11.18", features = ["blocking", "json"] }
-rocksdb = { version = "0.24", default-features = false, features = [
+blake3 = "1.8.7"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+codespan-reporting = "0.13.1"
+futures = "0.3.34"
+futures-util = "0.3.34"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["server", "http1"] }
+hyper-tungstenite = "0.30.0"
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
+memchr = "2.8.3"
+rand = { version = "0.10.3" }
+reqwest = { version = "0.13.5", features = ["json"] }
+rocksdb = { version = "0.25.0", default-features = false, features = [
   # LZ4 seems to be the best trade-off for compression size vs speed,
   # but these other compression algos are also supported. Multiple can
   # be enabled simulatneously, but limiting here to avoid compile times.
@@ -42,36 +43,33 @@ rocksdb = { version = "0.24", default-features = false, features = [
   "bindgen-runtime",
   # "bindgen-static",
 ], optional = true }
-rust-tracing = { git = "https://github.com/phylaxsystems/rust-tracing.git", branch = "main", features = [
-  "journald",
-] }
-serde = { version = "1.0.163", features = ["derive"] }
-serde_json = "1.0.96"
-simd-json = { version = "0.12.0", features = ["serde_impl"] }
+rust-tracing = { git = "https://github.com/phylaxsystems/rust-tracing.git", rev = "b6ac5ea23b58e2600e7b7a123be956e3a388ae8a", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+simd-json = { version = "0.18.1", features = ["serde_impl"] }
 sled = { version = "1.0.0-alpha.124", optional = true }
-thiserror = "2"
-tikv-jemallocator = "0.6.0"
-tokio = { version = "1.28.1", features = [
+thiserror = "2.0.20"
+tikv-jemallocator = "0.7.0"
+tokio = { version = "1.53.1", features = [
   "sync",
   "net",
   "rt-multi-thread",
   "macros",
 ] }
-tokio-stream = { version = "0.1.14", features = ["sync"] }
-tokio-tungstenite = { version = "0.20.1", features = ["native-tls"] }
-toml = "0.8"
-tracing = "0.1"
-tungstenite = "0.20.1"
-url = "2.4.0"
-xxhash-rust = { version = "0.8.7", features = [
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tokio-tungstenite = { version = "0.30.0", features = ["native-tls"] }
+toml = "1.1.6"
+tracing = "0.1.44"
+tungstenite = "0.30.0"
+url = "2.5.8"
+xxhash-rust = { version = "0.8.18", features = [
   "xxh3",
   "const_xxh3",
 ], optional = true }
-zerocopy = { version = "0.7.20", features = ["simd", "alloc"] }
-zerocopy-derive = "0.7.28"
 
 [dev-dependencies]
-serial_test = "3.2"
+sled = "1.0.0-alpha.124"
+serial_test = "4.0.1"
 
 # Maxperf profile for absolute maximum performance
 # Only use for builds that are going to get used by end users
@@ -81,13 +79,13 @@ lto = "fat"
 codegen-units = 1
 incremental = false
 
-# Optional Blutgang features
+# Optional rpsee features
 [features]
-journald = []
+journald = ["rust-tracing/journald"]
 default = ["selection-weighed-round-robin", "rocksdb", "sled"]
 sled = ["dep:sled"]
 rocksdb = ["dep:rocksdb"]
-xxhash = ["xxhash-rust"]                                       # 4x faster hashing but potentially less secure
+xxhash = ["dep:xxhash-rust"]                                       # non-cryptographic hashing
 no-cache = []                                                  # enable this to disable caching
 selection-weighed-round-robin = []                             # default algo
 selection-random = []                                          # optional random algo

@@ -1,12 +1,10 @@
 use rust_tracing::deps::metrics;
-use tokio::sync::{
-    mpsc,
-    oneshot,
-};
+use tokio::sync::{mpsc, oneshot};
 
 const CACHE_HITS: &str = "cache_hits";
 const CACHE_MISSES: &str = "cache_misses";
 const DB_SIZE_MB: &str = "db_size_mb";
+#[cfg(feature = "rocksdb")]
 const ROCKSDB_SIZE_PROPERTY: &str = "rocksdb.total-sst-files-size";
 
 /// Channel for sending requests to the database thread
@@ -98,6 +96,7 @@ pub trait GenericDatabase: Send {
     fn clear(&self) -> Result<(), Self::Error>;
 }
 
+#[cfg(any(feature = "sled", test))]
 impl GenericDatabase for sled::Db<{ crate::FANOUT }> {
     type Error = std::io::Error;
     type Config = sled::Config;
@@ -144,11 +143,9 @@ impl GenericDatabase for sled::Db<{ crate::FANOUT }> {
         V: GenericBytes,
     {
         let mut buf = sled::Batch::default();
-        batch.0.into_iter().for_each(|op| {
-            match op {
-                BatchOp::Insert(key, value) => buf.insert(key.as_ref(), value.as_ref()),
-                BatchOp::Delete(key) => buf.remove(key.as_ref()),
-            }
+        batch.0.into_iter().for_each(|op| match op {
+            BatchOp::Insert(key, value) => buf.insert(key.as_ref(), value.as_ref()),
+            BatchOp::Delete(key) => buf.remove(key.as_ref()),
         });
         self.apply_batch(buf).inspect(|_| {
             match self.size_on_disk().map(|size| size / (1024 * 1024)) {
@@ -162,12 +159,12 @@ impl GenericDatabase for sled::Db<{ crate::FANOUT }> {
     fn flush(&self) -> Result<(), Self::Error> {
         sled::Tree::<{ crate::FANOUT }>::flush(self)
             .map(|_| ())
-            .inspect(|_| {
-                match self.size_on_disk().map(|size| size / (1024 * 1024)) {
+            .inspect(
+                |_| match self.size_on_disk().map(|size| size / (1024 * 1024)) {
                     Ok(size) => metrics::gauge!(DB_SIZE_MB).set(size as f64),
                     Err(err) => tracing::warn!(?err, "failed to gauge database size"),
-                }
-            })
+                },
+            )
     }
 
     fn clear(&self) -> Result<(), Self::Error> {
@@ -186,6 +183,7 @@ impl GenericDatabase for sled::Db<{ crate::FANOUT }> {
 // NOTE: If in the future the database size is heavily affected by WAL or other database files,
 // we may also want to track that as part of `DB_SIZE_MB`. A list of properties can be found
 // here: https://github.com/facebook/rocksdb/blob/08809f5e6cd9cc4bc3958dd4d59457ae78c76660/include/rocksdb/db.h#L654-L689.
+#[cfg(feature = "rocksdb")]
 impl<T: rocksdb::ThreadMode + Send> GenericDatabase for rocksdb::DBWithThreadMode<T> {
     type Error = rocksdb::Error;
     type Config = (rocksdb::Options, std::path::PathBuf);
@@ -235,11 +233,9 @@ impl<T: rocksdb::ThreadMode + Send> GenericDatabase for rocksdb::DBWithThreadMod
         V: GenericBytes,
     {
         let mut buf = rocksdb::WriteBatch::new();
-        batch.0.iter().for_each(|op| {
-            match op {
-                BatchOp::Insert(key, value) => buf.put(key, value),
-                BatchOp::Delete(key) => buf.delete(key),
-            }
+        batch.0.iter().for_each(|op| match op {
+            BatchOp::Insert(key, value) => buf.put(key, value),
+            BatchOp::Delete(key) => buf.delete(key),
         });
         self.write(buf).inspect(|_| {
             match self
@@ -269,8 +265,8 @@ impl<T: rocksdb::ThreadMode + Send> GenericDatabase for rocksdb::DBWithThreadMod
     fn clear(&self) -> Result<(), Self::Error> {
         self.batch(Batch::<_, Box<[u8]>>::from(
             self.iterator(rocksdb::IteratorMode::Start)
-                .filter_map(|item| item.map(|(key, _)| BatchOp::Delete(key)).ok())
-                .collect::<Vec<BatchOp<_, _>>>(),
+                .map(|item| item.map(|(key, _)| BatchOp::Delete(key)))
+                .collect::<Result<Vec<BatchOp<_, _>>, _>>()?,
         ))
     }
 }

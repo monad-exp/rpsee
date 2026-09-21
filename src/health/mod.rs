@@ -1,6 +1,6 @@
 //! # `health` module
 //!
-//! Perhaps the most important piece of Blutgang,
+//! Perhaps the most important piece of Rpsee,
 //! the health module makes sure that every node is ready to accept requests,
 //! healthy, not syncing, and not falling behind the head of the chain.
 //!

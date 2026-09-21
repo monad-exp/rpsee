@@ -1,13 +1,7 @@
 # Security Policy
 
-## Supported Versions
-
-| Version | Supported          |
-| ------- | ------------------ |
-| < 0.2.1 | :x:                |
-| > 0.3.0 | :white_check_mark: |
-| master  | :white_check_mark: |
+Security fixes target the latest rpsee code on the default branch.
 
 ## Reporting a Vulnerability
 
-If you find a vulnerability that can compromise or degreade the performance of the host running Blutgang, please contact us directyl. We will try to respond and issue a fix ASAP.
+Report vulnerabilities privately to the repository maintainers. Use GitHub's **Report a vulnerability** option under the repository's **Security** tab when available. Include reproduction steps, the affected revision, configuration, and relevant logs with credentials removed.

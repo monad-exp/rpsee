@@ -1,78 +1,38 @@
 use crate::{
+    Settings, WsconnMessage,
     balancer::{
-        format::{
-            incoming_to_value,
-            replace_block_tags,
-        },
-        processing::{
-            cache_query,
-            update_rpc_latency,
-            CacheArgs,
-        },
+        format::{incoming_to_value, replace_block_tags, validate_request},
+        processing::{CacheArgs, cache_query, hash_request, update_rpc_latency},
         selection::select::pick,
     },
     cache_error,
     database::types::GenericBytes,
-    db_get,
-    no_rpc_available,
-    print_cache_error,
+    db_get, no_rpc_available, print_cache_error,
     rpc::types::Rpc,
-    rpc_response,
-    timed_out,
+    rpc_response, timed_out,
     websocket::{
         server::serve_websocket,
-        types::{
-            IncomingResponse,
-            SubscriptionData,
-        },
+        types::{IncomingResponse, SubscriptionData},
     },
-    Settings,
-    WsconnMessage,
 };
 
-use tokio::sync::{
-    broadcast,
-    mpsc,
-    watch,
-};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use serde_json::Value;
 
-// Select either blake3 or xxhash based on the features
-#[cfg(not(feature = "xxhash"))]
-use blake3::hash;
-
-#[cfg(feature = "xxhash")]
-use xxhash_rust::xxh3::xxh3_64;
-#[cfg(feature = "xxhash")]
-use zerocopy::AsBytes; // Impls AsBytes trait for u64
-
 use http_body_util::Full;
-use hyper::{
-    body::Bytes,
-    header::HeaderValue,
-    Request,
-};
-use hyper_tungstenite::{
-    is_upgrade_request,
-    upgrade,
-};
+use hyper::{Request, body::Bytes, header::HeaderValue};
+use hyper_tungstenite::{is_upgrade_request, upgrade};
 
 use tokio::time::timeout;
 
 use std::{
     convert::Infallible,
-    sync::{
-        Arc,
-        RwLock,
-    },
-    time::{
-        Duration,
-        Instant,
-    },
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
 };
 
-/// `ConnectionParams` contains the necessary data needed for blutgang
+/// `ConnectionParams` contains the necessary data needed for rpsee
 /// to fulfil an incoming request.
 #[derive(Clone)]
 pub struct ConnectionParams {
@@ -174,13 +134,17 @@ macro_rules! get_response {
         $ttl:expr,
         $max_retries:expr
     ) => {
-        match db_get!($cache_args.cache, $tx_hash.as_bytes().to_owned().into()) {
-            Ok(Some(mut rax)) => {
+        match db_get!($cache_args.cache, $tx_hash.as_bytes().to_owned().into()).map(|bytes| {
+            bytes.and_then(|mut bytes| {
+                simd_json::serde::from_slice::<Value>(&mut bytes)
+                    .ok()
+                    .filter(Value::is_object)
+            })
+        }) {
+            Ok(Some(mut cached)) => {
                 $rpc_position = None;
                 // Reconstruct ID
-                let mut cached: Value = simd_json::serde::from_slice(rax.as_mut()).unwrap();
-
-                cached["id"] = $id.into();
+                cached["id"] = $id.clone();
                 cached.to_string()
             }
             Ok(_) => {
@@ -199,7 +163,7 @@ macro_rules! get_response {
                 // If anything errors send an rpc request and see if it works, if not then gg
                 print_cache_error!();
                 $rpc_position = None;
-                return (cache_error!(), $rpc_position);
+                return (cache_error!($id.clone()), $rpc_position);
             }
         }
     };
@@ -217,14 +181,14 @@ macro_rules! fetch_from_rpc {
         $max_retries:expr
     ) => {{
         // Kinda jank but set the id back to what it was before
-        $tx["id"] = $id.into();
+        $tx["id"] = $id.clone();
 
         // Loop until we get a response
-        let mut rx;
+        let rx;
         let mut retries = 0;
         loop {
             // Get the next Rpc in line.
-            let mut rpc;
+            let rpc;
             {
                 let mut rpc_list_guard = $con_params.rpc_list.write().unwrap_or_else(|e| {
                     // Handle the case where the RwLock is poisoned
@@ -237,7 +201,7 @@ macro_rules! fetch_from_rpc {
 
             // Check if we have any RPCs in the list, if not return error
             if $rpc_position == None {
-                return (no_rpc_available!(), None);
+                return (no_rpc_available!($id.clone()), None);
             }
 
             // Send the request. And return a timeout if it takes too long
@@ -249,24 +213,26 @@ macro_rules! fetch_from_rpc {
             )
             .await
             {
-                Ok(rxa) => {
-                    rx = rxa.unwrap();
+                Ok(Ok(response)) => {
+                    rx = response;
                     break;
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "RPC request failed, retrying");
                 }
                 Err(_) => {
                     tracing::warn!("An RPC request has timed out, picking new RPC and retrying.");
-                    rpc.update_latency($ttl as f64);
-                    retries += 1;
                 }
             };
 
-            if retries == $max_retries {
-                return (timed_out!(), $rpc_position);
+            if retries >= $max_retries {
+                return (timed_out!($id.clone()), $rpc_position);
             }
+            retries += 1;
         }
 
         // Don't cache responses that contain errors or missing trie nodes
-        cache_query(&mut rx, $tx, $tx_hash, &$cache_args);
+        cache_query(&rx, $tx, $tx_hash, &$cache_args).await;
 
         rx
     }};
@@ -290,7 +256,7 @@ where
     // TODO: do content type validation more upstream
     // Check if body has application/json
     //
-    // Can be toggled via the config. Should be on if we want blutgang to be JSON-RPC compliant.
+    // Can be toggled via the config. Should be on if we want rpsee to be JSON-RPC compliant.
     if params.header_check
         && tx.headers().get("content-type") != Some(&HeaderValue::from_static("application/json"))
     {
@@ -303,32 +269,37 @@ where
         );
     }
 
-    // Convert incoming body to serde value
-    let mut tx = incoming_to_value(tx).await.unwrap();
+    let request = match incoming_to_value(tx).await {
+        Ok(request) => validate_request(&request).map(|()| request),
+        Err(_) => Err(serde_json::json!({
+            "jsonrpc": "2.0", "id": null,
+            "error": { "code": -32700, "message": "Parse error" },
+        })),
+    };
+    let mut tx = match request {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                Ok(hyper::Response::builder()
+                    .status(400)
+                    .header("Content-Type", "application/json")
+                    .body(Full::new(Bytes::from(error.to_string())))
+                    .unwrap()),
+                None,
+            );
+        }
+    };
 
-    // Get the id of the request and set it to 0 for caching
+    // Get the id of the request and set it to null for caching
     //
     // We're doing this ID gymnastics because we're hashing the
     // whole request and we don't want the ID as it's arbitrary
     // and does not impact the request result.
-    let id = tx["id"].take().as_u64().unwrap_or(0);
+    let id = tx["id"].take();
 
-    // Hash the request with either blake3 or xxhash depending on the enabled feature
-    let tx_hash;
-    #[cfg(not(feature = "xxhash"))]
-    {
-        tx_hash = hash(tx.to_string().as_bytes());
-    }
-    #[cfg(feature = "xxhash")]
-    {
-        tx_hash = xxh3_64(tx.to_string().as_bytes());
-    }
-
-    // RPC used to get the response, we use it to update the latency for it later.
-    let mut rpc_position;
-
-    // Rewrite named block parameters if possible
     let mut tx = replace_block_tags(&mut tx, &cache_args.named_numbers);
+    let tx_hash = hash_request(&tx);
+    let mut rpc_position;
 
     // Get the response from either the DB or from a RPC. If it timeouts, retry.
     let rax = get_response!(
@@ -449,4 +420,170 @@ where
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::{server::conn::http1, service::service_fn};
+    use hyper_util::rt::TokioIo;
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    async fn proxy(
+        rpc: Rpc,
+        cache_args: CacheArgs<[u8; 32], Vec<u8>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let channels = RequestChannels::new(
+            Arc::new(watch::channel(0).1),
+            mpsc::unbounded_channel().0,
+            broadcast::channel(1).1,
+        );
+        let params = ConnectionParams::new(
+            &Arc::new(RwLock::new(vec![rpc])),
+            channels,
+            &Arc::new(SubscriptionData::new()),
+            &Arc::new(RwLock::new(Settings {
+                max_retries: 0,
+                ..Settings::default()
+            })),
+        );
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let params = params.clone();
+                let cache_args = cache_args.clone();
+                tokio::spawn(async move {
+                    http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(move |request| {
+                                accept_request(request, params.clone(), cache_args.clone())
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        (address, task)
+    }
+
+    #[cfg(not(feature = "no-cache"))]
+    #[tokio::test]
+    async fn cached_http_calls_preserve_ids_and_follow_head() {
+        use http_body_util::BodyExt;
+        use hyper::Response;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let upstream_task = tokio::spawn(async move {
+            while let Ok((stream, _)) = upstream.accept().await {
+                let calls = calls_clone.clone();
+                tokio::spawn(async move {
+                    http1::Builder::new().serve_connection(TokioIo::new(stream), service_fn(move |request: Request<hyper::body::Incoming>| {
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let body = request.collect().await.unwrap().to_bytes();
+                            let request: Value = serde_json::from_slice(&body).unwrap();
+                            let response = json!({
+                                "jsonrpc": "2.0", "id": request["id"],
+                                "result": format!("{}:\n\"quoted\"", request["params"][1].as_str().unwrap()),
+                            });
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(response.to_string()))))
+                        }
+                    })).await.unwrap();
+                });
+            }
+        });
+        let cache_args = CacheArgs::default();
+        cache_args.named_numbers.write().unwrap().latest = 16;
+        let rpc = Rpc::new(upstream_url.parse().unwrap(), None, 1, 0, 1.0);
+        let (address, proxy_task) = proxy(rpc, cache_args.clone()).await;
+        let client = reqwest::Client::new();
+        for (id, head, expected_calls) in [
+            (json!("first"), 16, 1),
+            (json!(-7), 16, 1),
+            (json!("third"), 17, 2),
+        ] {
+            cache_args.named_numbers.write().unwrap().latest = head;
+            let response: Value = client.post(&address).timeout(Duration::from_secs(5)).json(&json!({
+                "jsonrpc": "2.0", "id": id, "method": "eth_getBalance", "params": ["0x1", "latest"],
+            })).send().await.unwrap().json().await.unwrap();
+            assert_eq!(response["id"], id);
+            assert_eq!(response["result"], format!("0x{head:x}:\n\"quoted\""));
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+        }
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_http_requests_return_structured_errors() {
+        let rpc = Rpc::new("http://127.0.0.1:1".parse().unwrap(), None, 1, 0, 1.0);
+        let (address, task) = proxy(rpc, CacheArgs::default()).await;
+        let client = reqwest::Client::new();
+        for (body, code, id) in [
+            (b"{".as_slice(), -32700, json!(null)),
+            (b"\xff".as_slice(), -32700, json!(null)),
+            (b"[]".as_slice(), -32600, json!(null)),
+            (b"null".as_slice(), -32600, json!(null)),
+            (b"42".as_slice(), -32600, json!(null)),
+            (b"{}".as_slice(), -32600, json!(null)),
+            (
+                br#"{"jsonrpc":"2.0","id":"original","method":false}"#.as_slice(),
+                -32600,
+                json!("original"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":true,"method":"eth_blockNumber"}"#.as_slice(),
+                -32600,
+                json!(null),
+            ),
+        ] {
+            let response = client
+                .post(&address)
+                .timeout(Duration::from_secs(5))
+                .header("Content-Type", "application/json")
+                .body(body.to_vec())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400);
+            let response: Value = response.json().await.unwrap();
+            assert_eq!(response["jsonrpc"], "2.0");
+            assert_eq!(response["error"]["code"], code);
+            assert_eq!(response["id"], id);
+            assert!(response.get("result").is_none());
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn upstream_connection_failure_returns_a_response_without_retrying_forever() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", upstream.local_addr().unwrap());
+        drop(upstream);
+        let rpc = Rpc::new(address.parse().unwrap(), None, 1, 0, 1.0);
+        let (address, task) = proxy(rpc, CacheArgs::default()).await;
+        let response = reqwest::Client::new()
+            .post(address)
+            .timeout(Duration::from_secs(5))
+            .json(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": [],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 408);
+        let error: Value = response.json().await.unwrap();
+        assert_eq!(error["id"], 1);
+        assert_eq!(error["error"]["code"], -32001);
+        task.abort();
+    }
 }

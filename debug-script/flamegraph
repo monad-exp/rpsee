@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 set -e
 
 if [ ! -x "$(command -v perf)" ]
@@ -14,11 +14,11 @@ if [ ! -x "$(command -v cargo-flamegraph)" ]; then
     cargo install flamegraph
     INSTALLED=1
 fi
-OUTFILE="flamegraph.blutgang.`git describe --always --dirty`-`date +%s`"
+OUTFILE="flamegraph.rpsee.$(git describe --always --dirty)-$(date +%s)"
 
 CARGO_PROFILE_RELEASE_DEBUG=true \
 cargo flamegraph \
-  --bin=blutgang \
+  --bin=rpsee \
   -o "${OUTFILE}.svg" \
   --release   \
   -- --config example_config.toml

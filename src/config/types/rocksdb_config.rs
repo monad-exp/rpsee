@@ -1,7 +1,4 @@
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// A list of options that can be applied to [`rocksdb::Options`].
@@ -52,9 +49,7 @@ impl From<RocksDbOptionsRepr> for rocksdb::Options {
     fn from(repr: RocksDbOptionsRepr) -> Self {
         let mut opts = Self::default();
 
-        if let Some(create_if_missing) = repr.create_if_missing {
-            opts.create_if_missing(create_if_missing);
-        }
+        opts.create_if_missing(repr.create_if_missing.unwrap_or(true));
         if let Some(create_missing_cfs) = repr.create_missing_column_families {
             opts.create_missing_column_families(create_missing_cfs);
         }
@@ -169,5 +164,29 @@ fn into_compression_type(s: String) -> rocksdb::DBCompressionType {
         "lz4hc" => rocksdb::DBCompressionType::Lz4hc,
         "zstd" => rocksdb::DBCompressionType::Zstd,
         _ => panic!("unknown compression type: {}", s),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_options_create_a_database_and_respect_explicit_opt_out() {
+        let path = std::env::temp_dir().join(format!(
+            "rpsee-rocksdb-config-{}-{}",
+            std::process::id(),
+            rand::random::<u64>(),
+        ));
+        let options = RocksDbOptionsRepr::default().into();
+        let db = rocksdb::DB::open(&options, &path).unwrap();
+        let options = RocksDbOptionsRepr {
+            create_if_missing: Some(false),
+            ..RocksDbOptionsRepr::default()
+        }
+        .into();
+        assert!(rocksdb::DB::open(&options, path.join("missing")).is_err());
+        drop(db);
+        std::fs::remove_dir_all(path).unwrap();
     }
 }

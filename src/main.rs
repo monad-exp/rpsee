@@ -1,5 +1,8 @@
 #![doc = include_str!("../README.md")]
 
+#[cfg(not(any(feature = "sled", feature = "rocksdb")))]
+compile_error!("enable at least one cache backend: sled or rocksdb");
+
 mod admin;
 mod balancer;
 mod config;
@@ -8,81 +11,48 @@ mod health;
 mod rpc;
 mod websocket;
 
+#[cfg(any(feature = "sled", test))]
+use crate::config::system::FANOUT;
+
 use crate::{
     admin::{
         listener::listen_for_admin_requests,
-        liveready::{
-            liveness_update_sink,
-            LiveReadyUpdate,
-            ReadinessState,
-        },
+        liveready::{LiveReadyUpdate, ReadinessState, liveness_update_sink},
     },
     balancer::{
-        accept_http::{
-            accept_request,
-            ConnectionParams,
-            RequestChannels,
-        },
+        accept_http::{ConnectionParams, RequestChannels, accept_request},
         processing::CacheArgs,
     },
     config::{
         cache_setup::setup_data,
-        system::FANOUT,
-        types::{
-            CacheSettings,
-            Settings,
-        },
+        types::{CacheSettings, Settings},
     },
-    database::{
-        accept::database_processing,
-        types::GenericDatabase,
-    },
+    database::{accept::database_processing, types::GenericDatabase},
     health::{
-        check::{
-            dropped_listener,
-            health_check,
-        },
+        check::{dropped_listener, health_check},
         head_cache::manage_cache,
-        safe_block::{
-            subscribe_to_new_heads,
-            NamedBlocknumbers,
-        },
+        safe_block::{NamedBlocknumbers, subscribe_to_new_heads},
     },
     rpc::types::Rpc,
     websocket::{
         client::ws_conn_manager,
         subscription_manager::subscription_dispatcher,
-        types::{
-            IncomingResponse,
-            SubscriptionData,
-            WsChannelErr,
-            WsconnMessage,
-        },
+        types::{IncomingResponse, SubscriptionData, WsChannelErr, WsconnMessage},
     },
 };
 
 use std::{
     collections::BTreeMap,
-    sync::{
-        Arc,
-        RwLock,
-    },
+    sync::{Arc, RwLock},
 };
 
 use tokio::{
     net::TcpListener,
-    sync::{
-        broadcast,
-        mpsc,
-        watch,
-    },
+    sync::{broadcast, mpsc, watch},
 };
 
-use hyper::{
-    server::conn::http1,
-    service::service_fn,
-};
-use hyper_util_blutgang::rt::TokioIo;
+use hyper::{server::conn::http1, service::service_fn};
+use hyper_util::rt::TokioIo;
 
 /// `jemalloc` offers faster mallocs when dealing with lots of threads which is what we're doing
 #[global_allocator]
@@ -102,7 +72,7 @@ fn init_tracing_subscriber() -> Option<rust_tracing::utils::otlp::OtelGuard> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing_subscriber();
+    let _tracing_guard = init_tracing_subscriber();
 
     // Get all the cli args and set them
     let mut settings = Settings::new()?;
@@ -114,16 +84,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create/Open DB
     match cache_settings {
+        #[cfg(feature = "sled")]
         CacheSettings::Sled(sled) => {
             let cache = <sled::Db<{ FANOUT }> as GenericDatabase>::open(&sled)
                 .expect("Can't open/create database!");
             run(cache, config).await
         }
+        #[cfg(feature = "rocksdb")]
         CacheSettings::RocksDB(rocks) => {
             let cache =
                 <rocksdb::DBWithThreadMode<rocksdb::SingleThreaded> as GenericDatabase>::open(&(
                     rocks,
-                    std::path::PathBuf::from("./blutgang-cache-rocksdb"),
+                    std::path::PathBuf::from("./rpsee-cache-rocksdb"),
                 ))
                 .expect("Can't open/create database!");
             run(cache, config).await
@@ -154,7 +126,7 @@ async fn run<DB: GenericDatabase + 'static>(
     // Cache for storing querries near the tip
     let head_cache = Arc::new(RwLock::new(BTreeMap::new()));
 
-    // Insert data about blutgang and our settings into the DB. Clears if specified.
+    // Insert data about rpsee and our settings into the DB. Clears if specified.
     //
     // Print any relevant warnings about a misconfigured DB. Check docs for more.
     setup_data(&cache, do_clear);

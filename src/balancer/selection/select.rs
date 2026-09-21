@@ -1,4 +1,5 @@
 use crate::Rpc;
+#[cfg(not(any(feature = "selection-random", feature = "old-weighted-round-robin")))]
 use std::time::SystemTime;
 
 // Generic entry point fn to select the next rpc and return its position
@@ -14,6 +15,7 @@ pub fn pick(list: &mut [Rpc]) -> (Rpc, Option<usize>) {
 }
 
 // Sorting algo
+#[cfg(any(not(feature = "selection-random"), test))]
 pub fn argsort(data: &[Rpc]) -> Vec<usize> {
     let mut indices = (0..data.len()).collect::<Vec<usize>>();
 
@@ -31,7 +33,6 @@ pub fn argsort(data: &[Rpc]) -> Vec<usize> {
 // as well as modify the cfg of the default algo to accomodate your new feature.
 //
 #[cfg(all(
-    feature = "selection-weighed-round-robin",
     not(feature = "selection-random"),
     not(feature = "old-weighted-round-robin"),
 ))]
@@ -52,7 +53,7 @@ fn algo(list: &mut [Rpc]) -> (Rpc, Option<usize>) {
     let mut choice_consecutive = 0;
     for i in indices.iter().rev() {
         if list[*i].max_consecutive > list[*i].consecutive
-            && (time - list[*i].last_used > list[*i].min_time_delta)
+            && (time.saturating_sub(list[*i].last_used) > list[*i].min_time_delta)
         {
             choice = *i;
             choice_consecutive = list[*i].consecutive;
@@ -68,21 +69,15 @@ fn algo(list: &mut [Rpc]) -> (Rpc, Option<usize>) {
     (list[choice].clone(), Some(choice))
 }
 
-#[cfg(all(
-    feature = "selection-weighed-round-robin",
-    feature = "selection-random"
-))]
+#[cfg(feature = "selection-random")]
 fn algo(list: &mut [Rpc]) -> (Rpc, Option<usize>) {
-    use rand::Rng;
-
-    let mut rng = rand::thread_rng();
-    let index = rng.gen_range(0..list.len());
+    let index = rand::random_range(0..list.len());
     (list[index].clone(), Some(index))
 }
 
 #[cfg(all(
-    feature = "selection-weighed-round-robin",
     feature = "old-weighted-round-robin",
+    not(feature = "selection-random")
 ))]
 fn algo(list: &mut [Rpc]) -> (Rpc, Option<usize>) {
     // Sort by latency
@@ -125,6 +120,7 @@ mod tests {
     // Change the latencies of the other ones to simulate
     // real network fluctuations.
     #[test]
+    #[cfg(not(feature = "selection-random"))]
     fn test_pick() {
         let mut rpc1 = Rpc::default();
         let mut rpc2 = Rpc::default();
@@ -165,6 +161,7 @@ mod tests {
 
     // Test max_delay when picking rpcs
     #[test]
+    #[cfg(not(any(feature = "selection-random", feature = "old-weighted-round-robin")))]
     fn test_pick_max_delay() {
         let mut rpc1 = Rpc::default();
         let mut rpc2 = Rpc::default();

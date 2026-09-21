@@ -5,40 +5,20 @@ use crate::{
     rpc::{
         error::RpcError,
         method::EthRpcMethod,
-        types::{
-            hex_to_decimal,
-            Rpc,
-        },
+        types::{Rpc, hex_to_decimal},
     },
     websocket::{
         client::execute_ws_call,
         subscription_manager::move_subscriptions,
-        types::{
-            IncomingResponse,
-            RequestResult,
-            SubscriptionData,
-            WsconnMessage,
-        },
+        types::{IncomingResponse, RequestResult, SubscriptionData, WsconnMessage},
     },
 };
 
-use std::sync::{
-    Arc,
-    RwLock,
-};
-
-use serde_json::Value;
+use std::sync::{Arc, RwLock};
 
 use tokio::{
-    sync::{
-        broadcast,
-        mpsc,
-        watch,
-    },
-    time::{
-        timeout,
-        Duration,
-    },
+    sync::{broadcast, mpsc, watch},
+    time::{Duration, timeout},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -127,10 +107,10 @@ pub async fn get_safe_block(
 
     // Collect the results in order from the channel
     for _ in 0..len {
-        if let Some(result) = rx.recv().await {
-            if result > safe {
-                safe = result;
-            }
+        if let Some(result) = rx.recv().await
+            && result > safe
+        {
+            safe = result;
         }
     }
 
@@ -165,12 +145,12 @@ async fn send_newheads_sub_message<K, V>(
     K: GenericBytes + From<[u8; 32]>,
     V: GenericBytes + From<Vec<u8>>,
 {
-    let mut call = format!(
-        r#"{{"jsonrpc":"2.0","method":"{}","params":["newHeads"],"id":"{}"}}"#,
-        EthRpcMethod::Subscribe,
-        user_id
-    );
-    let call: Value = unsafe { simd_json::from_str(&mut call).unwrap() };
+    let call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": EthRpcMethod::Subscribe,
+        "params": ["newHeads"],
+        "id": user_id.to_string(),
+    });
 
     match execute_ws_call(
         call.clone(),
@@ -260,16 +240,22 @@ pub async fn subscribe_to_new_heads<K, V>(
                         Ok(_) => {}
                         Err(_) => {
                             tracing::error!("WS incoming channel closed.");
-                            panic!("FATAL: WS module failed trying to reinitialize! Please restart Blutgang!");
+                            panic!(
+                                "FATAL: WS module failed trying to reinitialize! Please restart Rpsee!"
+                            );
                         }
                     }
                     drop(nn_rwlock);
                 }
-                tracing::warn!("Timeout in newHeads subscription, possible connection failiure or missed block.");
+                tracing::warn!(
+                    "Timeout in newHeads subscription, possible connection failiure or missed block."
+                );
                 let node_id = match sub_data.get_node_from_id(&subscription_id) {
                     Some(node_id) => node_id,
                     None => {
-                        tracing::error!("Failed to get some failed node subscription IDs! Subscriptions might be silently dropped!");
+                        tracing::error!(
+                            "Failed to get some failed node subscription IDs! Subscriptions might be silently dropped!"
+                        );
                         continue;
                     }
                 };

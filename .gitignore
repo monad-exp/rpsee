@@ -1,9 +1,9 @@
 /target
-*result
-/.nixos-test-history
-*.qcow2
 /.venv
-/blutgang-cache*
+/rpsee-cache*
+/db
+/config.toml
+/rpsee-admin.toml
 /benchmarks.txt
 /.DS_Store
 /.env

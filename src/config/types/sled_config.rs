@@ -1,7 +1,4 @@
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// A list of options that can be applied to [`sled::Config`].

@@ -1,68 +1,85 @@
-# Blutgang - the wd40 of ethereum load balancers
-![blutgang_gm](https://github.com/rainshowerLabs/blutgang/assets/55022497/ec668c7a-5f56-4b26-8386-f112c2f176ce)
+# rpsee
 
-Join the discussion on our [discord](https://discord.gg/92TfQWdjEh), [telegram](https://t.me/rainshower), or [matrix!](https://matrix.to/#/%23rainshower:matrix.org)
+rpsee is a caching load balancer for Ethereum JSON-RPC over HTTP and WebSocket. It is based on [Blutgang](https://github.com/rainshowerLabs/blutgang) by Rainshower Labs and its contributors.
 
-Blutgang is a blazing fast, caching, minimalistic load balancer designed with Ethereum's JSON-RPC in mind. Historical RPC queries are cached in a local database, bypassing the need for slow, repeating calls to your node.
+## Build and run
 
-For more info about blutgang and how to use it, please check out the [wiki](https://github.com/rainshowerLabs/blutgang/wiki).
+Install [Rust through rustup](https://rustup.rs/). The repository pins the Rust toolchain used by CI and Docker.
 
-## How to run 
-
-For detailed instructions on how to use blutgang, please read the [wiki](https://github.com/rainshowerLabs/blutgang/wiki).
-
-### Using cargo
-
-To install blutgang via cargo, run the following command:
+The default build includes Sled and RocksDB. RocksDB needs a C/C++ toolchain and libclang. On Debian or Ubuntu:
 
 ```bash
-cargo install blutgang
+sudo apt-get update
+sudo apt-get install build-essential clang libclang-dev libssl-dev pkg-config
 ```
-Once done, grab the `example_config.toml` from this repository, modify it to your liking, and start blutgang with it.
 
-### From source
+On macOS, install the Xcode command line tools with `xcode-select --install`.
 
-Clone the repository, and find the `example_config.toml` file. Edit it to your liking, and run `cargo run --release -- -c example_config.toml`.   
-
-If you want to use command line arguments instead, please run `cargo run --release -- --help` for more info. Keep in mind that the recommended way to run blutgang is via a config file.
-
-### Max performance
-
-If you need the absolute maximum performance from blutgang, compile it using the command below:
+From a checkout of this repository:
 
 ```bash
-RUSTFLAGS='-C target-cpu=native' cargo build --profile maxperf
+cp example_config.toml config.toml
+# Edit config.toml to configure your RPC endpoints.
+cargo run --release --locked -- --config config.toml
+```
+
+To install the binary from the checkout:
+
+```bash
+cargo install --path . --locked
+rpsee --config config.toml
+```
+
+Run `rpsee --help` for command line options. Command line values override the configuration file.
+
+Configuration uses `[rpsee]`, `[rpsee.admin]`, `[rpsee.sled]`, and `[rpsee.rocksdb]` tables. When migrating from Blutgang, rename those table prefixes, update cache paths as needed, and use the `rpsee_` prefix for admin RPC methods. Sled options use `cache_capacity_bytes` and `zstd_compression_level`; see [example_config.toml](example_config.toml).
+
+For a smaller build with only one cache backend:
+
+```bash
+cargo build --release --locked --no-default-features --features sled,selection-weighed-round-robin
+cargo build --release --locked --no-default-features --features rocksdb,selection-weighed-round-robin
+```
+
+Set `db` in the configuration to a backend enabled in your build.
+
+### Optimized build
+
+The `maxperf` profile enables link-time optimization. `target-cpu=native` additionally targets the build machine's CPU, so only use the resulting binary on compatible machines:
+
+```bash
+RUSTFLAGS='-C target-cpu=native' cargo build --locked --profile maxperf
 ```
 
 ### Docker
 
-The official docker image is available on [dockerhub](https://hub.docker.com/r/makemake1337/blutgang).  
-You must provide a config file to the docker container, as well as expose the port specified. Example:   
-```bash
-docker run -v /full/path/to/config.toml:/app/config.toml --network host makemake1337/blutgang
-```
-
-### Nix
-
-Using Flakes and the [nix-community/ethereum.nix](https://github.com/nix-community/ethereum.nix) overlay:
+Copy `example_config.toml` to `config.toml`, configure your RPC endpoints, and run:
 
 ```bash
-nix run github:nix-community/ethereum.nix#blutgang -- --help
+docker compose up --build
 ```
 
-## Benchmarks
-*Benchmarks were performed with a Ryzen 7 2700X, NVME SSD, and default Ubuntu 23.04 kernel. Same RPC endpoints were used*
+Compose exposes port 3000, mounts the config read-only, and stores cache data in a named volume. The container binds the public RPC listener to `0.0.0.0`; the admin listener remains disabled in the example configuration.
+
+To build and run the image directly:
 
 ```bash
-time sothis --source_rpc http://localhost:3000 --mode call_track --contract_address 0x1c479675ad559DC151F6Ec7ed3FbF8ceE79582B6 --origin_block 17885300 --terminal_block 17892269 --calldata 0x06f13056 --query_interval 20
+docker build -t rpsee .
+docker run --rm -p 3000:3000 \
+  --mount type=bind,src="$(pwd)/config.toml",dst=/etc/rpsee/config.toml,readonly \
+  --mount type=volume,src=rpsee-data,dst=/data \
+  rpsee
 ```
-![Figure_1](https://github.com/rainshowerLabs/blutgang/assets/55022497/8ce9a690-d2eb-4910-9a5d-807c2bdd4649)
-![Figure_2](https://github.com/rainshowerLabs/blutgang/assets/55022497/50d78e5f-2209-488d-82fc-8018388a82e7)
+
+The image workflow builds pull requests and publishes pushes to `master`, `main`, and `rpsee-v*` tags to `ghcr.io/<repository-owner>/<repository-name>` using the repository's GitHub token.
+
+## License
+
+The existing upstream GPL v2 license is preserved in [LICENSE-v1.md](https://github.com/QEDK/rpsee/blob/HEAD/LICENSE-v1.md). Monad Foundation contributions are licensed under GPL v3 as set out in [LICENSE](https://github.com/QEDK/rpsee/blob/HEAD/LICENSE). The additional license applies to those contributions and does not relicense upstream code.
 
 ## Acknowledgements
 
+- [Blutgang](https://github.com/rainshowerLabs/blutgang)
 - [dshackle](https://github.com/emeraldpay/dshackle)
 - [proxyd](https://github.com/ethereum-optimism/optimism/tree/develop/proxyd)
 - [web3-proxy](https://github.com/llamanodes/web3-proxy)
-
-Blutgang is standing on the shoulders of giants. Thank you to all the contributors of the projects above!

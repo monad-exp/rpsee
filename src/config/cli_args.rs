@@ -1,4 +1,4 @@
-//! Command line options for configuring blutgang.
+//! Command line options for configuring rpsee.
 //!
 //! The configuration options take precedence in this order: command line, config file, defaults.
 //! If a config file is present, but command line options are also present, the command line
@@ -27,15 +27,15 @@ const ADMIN_OPTS: &str = "Admin Namespace Options";
 // TODO: @eureka-cpu -- Add environment variables, and include a way to configure the metrics port?
 #[derive(Debug, clap::Parser)]
 #[command(
-    name = "blutgang",
+    name = "rpsee",
     version = crate::config::system::VERSION_STR,
     author,
-    about = "Blutgang load balancer and cache. For more info read the wiki: https://github.com/rainshowerLabs/blutgang/wiki",
+    about = "rpsee load balancer and cache for Ethereum JSON-RPC",
 )]
-pub struct Blutgang {
+pub struct Rpsee {
     // -- Core Configuration Options
     //
-    /// Path to a TOML config file for blutgang.
+    /// Path to a TOML config file for rpsee.
     #[arg(long, short = 'c', help_heading = CORE_OPTS)]
     pub config: Option<std::path::PathBuf>,
 
@@ -90,7 +90,7 @@ pub struct Blutgang {
     pub no_health_check: bool,
 
     /// Enable content type header checking. Useful if you want
-    /// Blutgang to be JSON-RPC compliant.
+    /// Rpsee to be JSON-RPC compliant.
     #[arg(long, help_heading = CORE_OPTS)]
     pub header_check: bool,
     #[arg(long, hide = true, conflicts_with = "header_check")]
@@ -110,10 +110,6 @@ pub struct Blutgang {
 
     // -- Admin Namespace Options
     //
-    /// Path to a privileged admin config.
-    #[arg(long, help_heading = ADMIN_OPTS)]
-    pub admin_path: Option<std::path::PathBuf>,
-
     /// Enable the admin namespace.
     #[arg(long, help_heading = ADMIN_OPTS)]
     pub admin: bool,
@@ -177,10 +173,8 @@ impl RpcList {
         url.into_iter()
             .enumerate()
             .map(|(i, url)| {
-                let mut delta = max_per_second.get(i).copied().unwrap_or(200);
-                if delta != 0 {
-                    delta = 1_000_000 / delta;
-                }
+                let rate = max_per_second.get(i).copied().unwrap_or(200);
+                let delta = 1_000_000_u64.checked_div(rate).unwrap_or(0);
                 Rpc::new(
                     url,
                     ws_url.get(i).cloned(),
@@ -195,9 +189,12 @@ impl RpcList {
 
 #[derive(Debug, Clone, Default, clap::ValueEnum)]
 pub(crate) enum Db {
+    #[cfg(feature = "sled")]
     #[default]
     Sled,
 
+    #[cfg(feature = "rocksdb")]
+    #[cfg_attr(not(feature = "sled"), default)]
     #[clap(name = "rocksdb")]
     RocksDb,
 }

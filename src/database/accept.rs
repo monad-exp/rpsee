@@ -1,16 +1,7 @@
-use crate::database::types::{
-    Batch,
-    DbRequest,
-    GenericBytes,
-    GenericDatabase,
-    RequestKind,
-};
+use crate::database::types::{Batch, DbRequest, GenericBytes, GenericDatabase, RequestKind};
 use tokio::sync::{
     mpsc::UnboundedSender,
-    oneshot::{
-        self,
-        Receiver,
-    },
+    oneshot::{self, Receiver},
 };
 
 /// Processes incoming requests from clients and returns responses
@@ -51,10 +42,7 @@ macro_rules! db_get {
         $channel:expr,
         $data:expr
     ) => {{
-        use $crate::database::types::{
-            DbRequest,
-            RequestKind,
-        };
+        use $crate::database::types::{DbRequest, RequestKind};
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let req = DbRequest::new(RequestKind::Read($data), tx);
@@ -100,10 +88,7 @@ where
 #[macro_export]
 macro_rules! db_flush {
     ($channel:expr) => {{
-        use $crate::database::types::{
-            DbRequest,
-            RequestKind,
-        };
+        use $crate::database::types::{DbRequest, RequestKind};
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let req: DbRequest<_, _> = DbRequest::new(RequestKind::Flush, tx);

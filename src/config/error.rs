@@ -1,14 +1,17 @@
 //! Configuration errors
 
-use std::{
-    io,
-    path,
-};
+use std::{io, path};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(transparent)]
     RpcError(#[from] crate::rpc::error::RpcError),
+
+    #[error("invalid {field}: {reason}")]
+    InvalidValue {
+        field: &'static str,
+        reason: &'static str,
+    },
 
     #[error("Node is syncing!")]
     Syncing,

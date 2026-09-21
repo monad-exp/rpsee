@@ -1,12 +1,12 @@
 # To use the config file, use the -c/--config option pointing to the path of a config file
 
-# Config for blutgang goes here
-[blutgang]
+# Config for rpsee goes here
+[rpsee]
 # Clear the cache DB on startup
 clear_cache = false
-# Address to bind blutgang to
+# Address to bind rpsee to
 address = "127.0.0.1"
-# Port to bind blutgang to
+# Port to bind rpsee to
 port = 3000
 # Moving average length for the latency
 ma_length = 100
@@ -15,7 +15,7 @@ sort_on_startup = true
 # Enable health checking
 health_check = true
 # Enable content type header checking. Set this to `true` if you want
-# Blutgang to be JSON-RPC compliant.
+# rpsee to be JSON-RPC compliant.
 header_check = true
 # Acceptable time to wait for a response in ms
 ttl = 30
@@ -30,13 +30,8 @@ supress_rpc_check = false
 # Choose which database backend to use for caching
 db = "sled"
 
-# Note: the admin namespace contains volatile functions and
-# should not be exposed publicly. Values can be provided directly
-# for testing, but it's recommended to configure an admin file
-# and provide the path.
-[blutgang.admin]
-# Path to a privileged admin config
-path = "./blutgang-admin.toml"
+# The admin namespace contains privileged operations and should not be exposed publicly.
+[rpsee.admin]
 # Enable the admin namespace
 enable = false
 # Address for the admin RPC
@@ -55,36 +50,37 @@ key = ""
 # Sled config
 # Sled is one of the databases we use for our cache, for more info check their docs
 # https://docs.rs/sled/1.0.0-alpha.124/sled/struct.Config.html
-[blutgang.sled]
+[rpsee.sled]
 # Path to db
-path = "./blutgang-cache-sled"
+path = "./rpsee-cache-sled"
 # Cache size in bytes.
-cache_capacity = 1000000000
-# Select zstd compression level. Reduces size 60-70%,
-# and increases CPU and latency by around 10% for db writes and 2% for reads
-compression = 1
+cache_capacity_bytes = 1000000000
+# zstd compression level
+zstd_compression_level = 1
 # Frequency of flushes in ms
 flush_every_ms = 12000
 
 # RocksDB config
 # RocksDB is one of the databases we use for our cache, for more info check their docs
 # https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide
-[blutgang.rocksdb]
+[rpsee.rocksdb]
 # General options
 create_if_missing = true
 create_missing_column_families = false
 error_if_exists = false
 paranoid_checks = true
 
-# Paths
-db_paths = [{ path = "./db", target_size = 1073741824 }]
-db_log_dir = "./db/logs"
-wal_dir = "./db/wal"
+# Optional paths. Create parent directories before enabling custom paths.
+# db_paths = [{ path = "./db", target_size = 1073741824 }]
+# db_log_dir = "./db/logs"
+# wal_dir = "./db/wal"
 
 # Performance tuning
 increase_parallelism = 8
-optimize_level_style_compaction = 512
-optimize_universal_style_compaction = 512
+# Memtable memory budget in bytes
+optimize_level_style_compaction = 536870912
+optimize_universal_style_compaction = 536870912
+# Block cache size in MiB
 optimize_for_point_lookup = 64
 
 # File limits / concurrency
@@ -92,12 +88,12 @@ max_open_files = 1024
 max_file_opening_threads = 4
 max_background_jobs = 8
 
-# Write buffers
-write_buffer_size = 64
+# Buffer and file sizes are in bytes
+write_buffer_size = 67108864
 max_write_buffer_number = 4
 min_write_buffer_number = 2
-target_file_size_base = 64
-max_bytes_for_level_base = 1024
+target_file_size_base = 67108864
+max_bytes_for_level_base = 1073741824
 max_bytes_for_level_multiplier = 10.0
 
 # Level triggers
@@ -112,8 +108,8 @@ bytes_per_sync = 1048576
 wal_bytes_per_sync = 1048576
 
 # Compression
-compression_type = "Snappy"
-bottommost_compression_type = "Zstd"
+compression_type = "snappy"
+bottommost_compression_type = "zstd"
 
 # Add separate RPCs as an array of TOML tables
 [[rpc]]

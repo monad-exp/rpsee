@@ -1,10 +1,7 @@
 //! WebSocket module errors.
 
 use std::fmt;
-use tokio::sync::{
-    broadcast,
-    mpsc,
-};
+use tokio::sync::{broadcast, mpsc};
 
 #[derive(Debug)]
 pub enum WsError {

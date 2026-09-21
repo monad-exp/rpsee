@@ -1,15 +1,16 @@
-version: '3'
 services:
-  load_balancer:
-    build:
-      context: .
-      dockerfile: Dockerfile
+  rpsee:
+    build: .
     ports:
-      - "3000-4000:3000-4000"  # Expose a range of ports from 3000 to 4000 (adjust as needed)
+      - "3000:3000"
     volumes:
-      - ./:/app
-    working_dir: /app
+      - type: bind
+        source: ./config.toml
+        target: /etc/rpsee/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - rpsee-data:/data
 
-networks:
-  blutgang_net:
-    driver: bridge
+volumes:
+  rpsee-data:

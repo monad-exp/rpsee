@@ -1,30 +1,16 @@
 use crate::{
-    config::system::{
-        MAGIC,
-        WS_SUB_MANAGER_ID,
-    },
+    config::system::{MAGIC, WS_SUB_MANAGER_ID},
     rpc::method::EthRpcMethod,
     websocket::{
         error::WsError,
-        types::{
-            IncomingResponse,
-            RequestResult,
-            SubscriptionData,
-            WsconnMessage,
-        },
+        types::{IncomingResponse, RequestResult, SubscriptionData, WsconnMessage},
     },
 };
 
-use std::{
-    collections::HashMap,
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::{
-    broadcast::{
-        self,
-        error::RecvError,
-    },
+    broadcast::{self, error::RecvError},
     mpsc,
 };
 
@@ -156,7 +142,6 @@ mod tests {
     use crate::rpc::method::EthRpcMethod;
 
     use super::*;
-    use rand::Rng;
     use serde_json::json;
     use std::time::Duration;
 
@@ -225,7 +210,7 @@ mod tests {
             while let Some(WsconnMessage::Message(message, _)) = incoming_rx.recv().await {
                 if message["method"].eq(&EthRpcMethod::Subscribe) {
                     let id = message["id"].as_u64().unwrap() as u32;
-                    let random_result = rand::thread_rng().gen::<u64>().to_string();
+                    let random_result = rand::random::<u64>().to_string();
                     let mock_response = IncomingResponse {
                         content: json!({"jsonrpc": "2.0", "id": id, "result": random_result}),
                         node_id: 2, // new node ID

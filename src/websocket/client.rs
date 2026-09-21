@@ -1,62 +1,29 @@
 use crate::{
     balancer::{
-        format::replace_block_tags,
-        processing::{
-            cache_query,
-            update_rpc_latency,
-            CacheArgs,
-        },
+        format::{replace_block_tags, validate_request},
+        processing::{CacheArgs, cache_query, hash_request, update_rpc_latency},
         selection::select::pick,
     },
     database::types::GenericBytes,
     db_get,
-    rpc::{
-        method::EthRpcMethod,
-        types::Rpc,
-    },
+    rpc::{method::EthRpcMethod, types::Rpc},
     websocket::{
         error::WsError,
-        types::{
-            IncomingResponse,
-            SubscriptionData,
-            WsChannelErr,
-            WsconnMessage,
-        },
+        types::{IncomingResponse, SubscriptionData, WsChannelErr, WsconnMessage},
     },
 };
 
 use std::{
-    sync::{
-        Arc,
-        RwLock,
-    },
+    sync::{Arc, RwLock},
     time::Instant,
 };
 
-use futures_util::{
-    SinkExt,
-    StreamExt,
-};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use simd_json::{
-    from_slice,
-    from_str,
-};
+use simd_json::from_slice;
 
-use tokio::sync::{
-    broadcast,
-    mpsc,
-};
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::protocol::Message,
-};
-
-#[cfg(not(feature = "xxhash"))]
-use blake3::hash;
-
-#[cfg(feature = "xxhash")]
-use xxhash_rust::xxh3::xxh3_64;
+use tokio::sync::{broadcast, mpsc};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 /// Accepts incoming internal WS messages.
 ///
@@ -227,7 +194,7 @@ pub async fn ws_conn(
     ws_error_tx: mpsc::UnboundedSender<WsChannelErr>,
     index: usize,
 ) {
-    let ws_stream = match connect_async(&rpc.ws_url.unwrap()).await {
+    let ws_stream = match connect_async(rpc.ws_url.as_ref().unwrap().as_str()).await {
         Ok((ws_stream, _)) => ws_stream,
         Err(_) => {
             tracing::error!(
@@ -247,7 +214,7 @@ pub async fn ws_conn(
             tracing::debug!("ws_conn[{}], send: {:?}", index, incoming);
 
             if ws_sender
-                .send(Message::Text(incoming.to_string()))
+                .send(Message::Text(incoming.to_string().into()))
                 .await
                 .is_err()
             {
@@ -265,7 +232,7 @@ pub async fn ws_conn(
                     let time = Instant::now();
                     tracing::debug!("ws_conn[{}], recv: {:?}", index, message);
 
-                    let mut ws_message = match message.into_text() {
+                    let ws_message = match message.into_text() {
                         Ok(rax) => rax,
                         Err(e) => {
                             tracing::error!(?e, "Received malformed message from ws_conn");
@@ -274,7 +241,7 @@ pub async fn ws_conn(
                         }
                     };
 
-                    let rax = match unsafe { from_str(&mut ws_message) } {
+                    let rax = match from_slice(&mut ws_message.as_bytes().to_vec()) {
                         Ok(rax) => rax,
                         Err(_e) => {
                             {
@@ -326,22 +293,21 @@ where
         call
     );
 
+    if let Err(error) = validate_request(&call) {
+        return Ok(error.to_string());
+    }
     let id = call["id"].take();
-    let tx_hash = {
-        #[cfg(not(feature = "xxhash"))]
-        {
-            hash(call.to_string().as_bytes())
-        }
-        #[cfg(feature = "xxhash")]
-        {
-            xxh3_64(call.to_string().as_bytes())
-        }
-    };
+    let is_subscription = call["method"].eq(&EthRpcMethod::Subscribe);
+    if !is_subscription {
+        call = replace_block_tags(&mut call, &cache_args.named_numbers);
+    }
+    let tx_hash = hash_request(&call);
 
-    if let Ok(Some(mut rax)) = db_get!(cache_args.cache, tx_hash.as_bytes().to_owned().into()) {
-        let mut cached: Value = from_slice(rax.as_mut()).unwrap();
-        cached["id"] = id;
-        return Ok(cached.to_string());
+    if let Ok(Some(mut bytes)) = db_get!(cache_args.cache, tx_hash.as_bytes().to_owned().into())
+        && let Ok(Value::Object(mut cached)) = from_slice::<Value>(&mut bytes)
+    {
+        cached.insert("id".into(), id);
+        return Ok(Value::Object(cached).to_string());
     }
 
     // Remove and unsubscribe user is "eth_unsubscribe"
@@ -376,7 +342,6 @@ where
         ));
     }
 
-    let is_subscription = call["method"].eq(&EthRpcMethod::Subscribe);
     if is_subscription {
         // Check if we're already subscribed to this
         // if so return the subscription id and add this user to the dispatch
@@ -388,9 +353,6 @@ where
                 id, rax
             ));
         }
-    } else {
-        // Replace block tags if applicable
-        call = replace_block_tags(&mut call, &cache_args.named_numbers);
     }
 
     call["id"] = user_id.into();
@@ -415,7 +377,7 @@ where
         sub_data.register_subscription(call.clone(), sub_id.clone(), response.node_id);
         sub_data.subscribe_user(user_id, call)?;
     } else {
-        cache_query(&mut response.content.to_string(), call, tx_hash, cache_args).await;
+        cache_query(&response.content.to_string(), call, tx_hash, cache_args).await;
     }
 
     response.content["id"] = id;
@@ -455,7 +417,7 @@ mod tests {
     }
 
     async fn create_mock_rpc_list() -> Arc<RwLock<Vec<Rpc>>> {
-        let rpc_list = Arc::new(RwLock::new(vec![
+        Arc::new(RwLock::new(vec![
             Rpc::new(
                 "http://test1".parse().unwrap(),
                 Some("ws://test1".parse().unwrap()),
@@ -470,11 +432,11 @@ mod tests {
                 0,
                 0.0,
             ),
-        ]));
-        rpc_list
+        ]))
     }
 
     // Helper function to setup the environment for ws_conn_manager tests
+    #[allow(clippy::type_complexity)]
     fn setup_ws_conn_manager_test() -> (
         Arc<RwLock<Vec<Rpc>>>,
         mpsc::UnboundedSender<WsconnMessage>,
@@ -619,6 +581,85 @@ mod tests {
             result.unwrap(),
             "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":\"0x1a2b3c\"}"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_ws_requests_return_errors_without_dispatch() {
+        let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
+        let (_broadcast_tx, broadcast_rx) = broadcast::channel(1);
+        let sub_data = Arc::new(SubscriptionData::new());
+        let cache_args = CacheArgs::default();
+        for call in [
+            json!([]),
+            json!(null),
+            json!(false),
+            json!({}),
+            json!({"jsonrpc":"2.0","id":"original","method":false}),
+        ] {
+            let response = execute_ws_call(
+                call.clone(),
+                1,
+                &incoming_tx,
+                broadcast_rx.resubscribe(),
+                &sub_data,
+                &cache_args,
+            )
+            .await
+            .unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["error"]["code"], -32600);
+            assert_eq!(response["id"], call["id"]);
+            assert!(incoming_rx.try_recv().is_err());
+        }
+    }
+
+    #[cfg(not(feature = "no-cache"))]
+    #[tokio::test]
+    async fn cached_ws_calls_follow_head_and_preserve_ids() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
+        let (broadcast_tx, broadcast_rx) = broadcast::channel(10);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let upstream = tokio::spawn(async move {
+            while let Some(WsconnMessage::Message(request, _)) = incoming_rx.recv().await {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+                broadcast_tx.send(IncomingResponse {
+                    node_id: 0,
+                    content: json!({"jsonrpc": "2.0", "id": request["id"], "result": request["params"][1]}),
+                }).unwrap();
+            }
+        });
+        let cache_args = CacheArgs::default();
+        let sub_data = Arc::new(SubscriptionData::new());
+        for (id, head, expected_calls) in [
+            (json!("first"), 16, 1),
+            (json!(-7), 16, 1),
+            (json!("third"), 17, 2),
+        ] {
+            cache_args.named_numbers.write().unwrap().latest = head;
+            let call = json!({"jsonrpc": "2.0", "id": id, "method": "eth_getBalance", "params": ["0x1", "latest"]});
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                execute_ws_call(
+                    call,
+                    1,
+                    &incoming_tx,
+                    broadcast_rx.resubscribe(),
+                    &sub_data,
+                    &cache_args,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["id"], id);
+            assert_eq!(response["result"], format!("0x{head:x}"));
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+        }
+        upstream.abort();
     }
 
     #[tokio::test]

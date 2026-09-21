@@ -1,19 +1,28 @@
-FROM rust:1.79-bookworm AS build
+FROM rust:slim AS build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential clang libclang-dev libssl-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY . .
+ARG CARGO_BUILD_JOBS=2
+ARG TARGETARCH
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,id=rpsee-target-${TARGETARCH},target=/app/target,sharing=locked \
+    cargo build --locked --profile maxperf \
+    && cp target/maxperf/rpsee /usr/local/bin/rpsee
 
-COPY . /app
+FROM debian:stable-slim
 
-RUN apt-get update && apt-get install -y libssl-dev pkg-config
-# Docker is a pos
-RUN cargo build --profile maxperf
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3t64 libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
 
-FROM debian:bookworm
+COPY --from=build /usr/local/bin/rpsee /usr/local/bin/rpsee
 
-RUN mkdir /app
-RUN apt-get update && apt-get install -y openssl ca-certificates
-
-COPY --from=build /app/target/maxperf/blutgang /app/blutgang
-
-WORKDIR /app
-CMD ["./blutgang", "-c", "config.toml"]
+WORKDIR /data
+EXPOSE 3000
+ENTRYPOINT ["rpsee"]
+CMD ["--config", "/etc/rpsee/config.toml", "--address", "0.0.0.0"]

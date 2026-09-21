@@ -1,54 +1,26 @@
 use crate::{
-    admin::liveready::{
-        accept_health_request,
-        accept_readiness_request,
-        LiveReadyRequestSnd,
-    },
-    database::types::{
-        GenericBytes,
-        RequestBus,
-    },
+    admin::liveready::{LiveReadyRequestSnd, accept_health_request, accept_readiness_request},
+    database::types::{GenericBytes, RequestBus},
 };
 use http_body_util::Full;
-use hyper::{
-    body::Bytes,
-    Request,
-};
+use hyper::{Request, body::Bytes};
 
-use jsonwebtoken::{
-    decode,
-    Validation,
-};
+use jsonwebtoken::{Validation, decode};
 
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::{Deserialize, Serialize};
 
-use serde_json::{
-    json,
-    Value,
-    Value::Null,
-};
+use serde_json::{Value, Value::Null, json};
 
 use std::{
     convert::Infallible,
-    sync::{
-        Arc,
-        RwLock,
-    },
+    sync::{Arc, RwLock},
     time::Instant,
 };
 
-use crate::{
-    admin::methods::execute_method,
-    balancer::format::incoming_to_value,
-    Rpc,
-    Settings,
-};
+use crate::{Rpc, Settings, admin::methods::execute_method, balancer::format::incoming_to_value};
 
 /// For decoding JWT
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Claims {
     id: Value,
     jsonrpc: Value,
@@ -57,47 +29,9 @@ struct Claims {
     exp: usize,
 }
 
-/// Macro for getting responses from either the cache or RPC nodes.
-///
-/// Since we don't cache the admin request responses, this functions
-/// quite differently from the one you'll find in `blutgang/balancer/accept_http.rs`
-macro_rules! get_response {
-    (
-        $tx:expr,
-        $id:expr,
-        $rpc_list_rwlock:expr,
-        $poverty_list_rwlock:expr,
-        $config:expr,
-        $cache:expr,
-    ) => {{
-        // Execute the request and store it into rx
-        let mut rx = match execute_method(
-            $tx,
-            $rpc_list_rwlock,
-            $poverty_list_rwlock,
-            Arc::clone(&$config),
-            $cache.clone(),
-        ).await {
-            Ok(rx) => rx,
-            Err(err) => json!({
-                "id": Null,
-                "jsonrpc": "2.0",
-                "result": err.to_string(),
-            }),
-        };
-
-        // Set the id to whatever it was
-        rx["id"] = $id.into();
-
-        let rx_str = rx.to_string();
-
-        rx_str
-    }};
-}
-
 /// Execute request and construct a HTTP response
 async fn forward_body<K, V>(
-    mut tx: Value,
+    tx: Value,
     rpc_list_rwlock: &Arc<RwLock<Vec<Rpc>>>,
     poverty_list_rwlock: &Arc<RwLock<Vec<Rpc>>>,
     cache: RequestBus<K, V>,
@@ -107,24 +41,33 @@ where
     K: GenericBytes,
     V: GenericBytes,
 {
-    // Get the id of the request and set it to 0 for caching
-    //
-    // We're doing this ID gymnastics because we're hashing the
-    // whole request and we don't want the ID as it's arbitrary
-    // and does not impact the request result.
-    let id = tx["id"].take().as_u64().unwrap_or(0);
-
-    // Get the response from either the DB or from a RPC. If it timeouts, retry.
-    let rax = get_response!(tx, id, rpc_list_rwlock, poverty_list_rwlock, config, cache,);
-
-    // Convert rx to bytes and but it in a Buf
-    let body = hyper::body::Bytes::from(rax);
-
-    // Put it in a http_body_util::Full
-    let body = Full::new(body);
-
-    //Build the response
-    let res = hyper::Response::builder().status(200).body(body).unwrap();
+    let id = tx.get("id").cloned().unwrap_or(Null);
+    let mut response = if !tx.is_object() || tx["jsonrpc"] != "2.0" || !tx["method"].is_string() {
+        json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}})
+    } else {
+        match execute_method(tx, rpc_list_rwlock, poverty_list_rwlock, config, cache).await {
+            Ok(response) => response,
+            Err(err) => {
+                use crate::admin::error::AdminError;
+                let code = match &err {
+                    AdminError::InvalidMethod(_) => -32601,
+                    AdminError::InvalidParams
+                    | AdminError::InvalidLen
+                    | AdminError::ParseError
+                    | AdminError::OutOfBounds => -32602,
+                    AdminError::WriteProtectionEnabled => -32000,
+                    AdminError::Inaccessible => -32603,
+                };
+                json!({"jsonrpc": "2.0", "error": {"code": code, "message": err.to_string()}})
+            }
+        }
+    };
+    response["id"] = id;
+    let res = hyper::Response::builder()
+        .status(200)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(response.to_string())))
+        .unwrap();
 
     Ok(res)
 }
@@ -179,9 +122,6 @@ where
             }
         };
 
-        // Reconstruct the TX as a normal json rpc request
-        tracing::info!(?token, "JWT claims");
-
         tx = json!({
             "id": token.claims.id,
             "jsonrpc": "2.0",
@@ -202,7 +142,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::methods::BlutgangRpcMethod;
+    use crate::admin::methods::RpseeRpcMethod;
     use crate::database_processing;
     use jsonwebtoken::DecodingKey;
     use sled::Config;
@@ -211,8 +151,10 @@ mod tests {
 
     // Helper function to create a test Settings config
     fn create_test_settings() -> Arc<RwLock<Settings>> {
-        let mut config = Settings::default();
-        config.do_clear = true;
+        let mut config = Settings {
+            do_clear: true,
+            ..Settings::default()
+        };
         config.admin.key = DecodingKey::from_secret(b"some-key");
         Arc::new(RwLock::new(config))
     }
@@ -228,34 +170,61 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
-    async fn test_forward_body() {
+    async fn forward_body_preserves_ids_and_reports_rpc_errors() {
+        use http_body_util::BodyExt;
+
         let settings = create_test_settings();
         let cache = create_test_cache();
         let rpc_list = Arc::new(RwLock::new(vec![]));
         let poverty_list = Arc::new(RwLock::new(vec![]));
-
-        // Create a test request (use the actual request format here)
-        let tx = json!({
-            "id": 1,
-            "jsonrpc": "2.0",
-            "method": BlutgangRpcMethod::Ttl,
-            "params": [],
-        });
-
-        // Call forward_body with the test data
-        let result = forward_body(
-            tx.clone(),
-            &rpc_list,
-            &poverty_list,
-            cache.clone(),
-            settings,
-        )
-        .await;
-
-        // You can assert that the result matches the expected outcome
-        assert!(result.is_ok());
-
-        // Additional assertions can be added based on expected behavior
+        for id in [json!("request-1"), json!(7), Null] {
+            let request = json!({
+                "id": id, "jsonrpc": "2.0", "method": RpseeRpcMethod::Ttl, "params": [],
+            });
+            let response = forward_body(
+                request,
+                &rpc_list,
+                &poverty_list,
+                cache.clone(),
+                settings.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                response.headers()[hyper::header::CONTENT_TYPE],
+                "application/json"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let response: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["id"], id);
+            assert_eq!(response["result"], json!(settings.read().unwrap().ttl));
+        }
+        for (request, code) in [
+            (
+                json!({"id": "unknown", "jsonrpc": "2.0", "method": "missing"}),
+                -32601,
+            ),
+            (
+                json!({"id": "invalid", "jsonrpc": "2.0", "method": RpseeRpcMethod::SetTtl, "params": []}),
+                -32602,
+            ),
+            (Null, -32600),
+        ] {
+            let id = request.get("id").cloned().unwrap_or(Null);
+            let response = forward_body(
+                request,
+                &rpc_list,
+                &poverty_list,
+                cache.clone(),
+                settings.clone(),
+            )
+            .await
+            .unwrap();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let response: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["id"], id);
+            assert_eq!(response["error"]["code"], code);
+            assert!(response.get("result").is_none());
+        }
     }
 }

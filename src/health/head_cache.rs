@@ -1,25 +1,15 @@
 use crate::database::{
     accept::db_batch,
     error::DbError,
-    types::{
-        Batch,
-        GenericBytes,
-        RequestBus,
-    },
+    types::{Batch, GenericBytes, RequestBus},
 };
 
 use std::{
     collections::BTreeMap,
-    sync::{
-        Arc,
-        RwLock,
-    },
+    sync::{Arc, RwLock},
 };
 
-use tokio_stream::{
-    wrappers::WatchStream,
-    StreamExt,
-};
+use tokio_stream::{StreamExt, wrappers::WatchStream};
 
 /// Check if we need to do a reorg or if a new block has finalized.
 pub async fn manage_cache<K, V>(
@@ -75,19 +65,16 @@ where
     K: GenericBytes,
     V: GenericBytes,
 {
-    let range = block_number..=new_block;
-    let mut batch = Batch::with_capacity(range.clone().count());
-
-    // Go over the head cache and get all the keys from block_number to new_block
+    let mut batch = Batch::with_capacity(0);
     {
-        let mut head_cache_guard = head_cache.write().unwrap();
-        for i in range {
-            if let Some(keys) = head_cache_guard.get(&i).cloned() {
-                for key in keys {
-                    batch.delete(key);
-                }
-                // Remove the entry from the head_cache
-                head_cache_guard.remove(&i);
+        let mut entries = head_cache.write().unwrap();
+        let blocks: Vec<_> = entries
+            .range(new_block..=block_number)
+            .map(|(&number, _)| number)
+            .collect();
+        for number in blocks {
+            for key in entries.remove(&number).unwrap() {
+                batch.delete(key);
             }
         }
     }
@@ -106,18 +93,10 @@ fn remove_stale<K: GenericBytes>(
     head_cache: &Arc<RwLock<BTreeMap<u64, Vec<K>>>>,
     block_number: u64,
 ) -> Result<(), DbError> {
-    // Get the lowest block_number from the BTreeMap
-    let mut head_cache_guard = head_cache.write().unwrap();
-
-    let oldest = match head_cache_guard.iter().next() {
-        Some((oldest, _)) => *oldest,
-        None => return Ok(()), // Return early if the map is empty
-    };
-
-    // Remove all entries from the head_cache up to block_number
-    for i in oldest..=block_number + 1 {
-        head_cache_guard.remove(&i);
-    }
+    head_cache
+        .write()
+        .unwrap()
+        .retain(|number, _| *number > block_number);
 
     Ok(())
 }
@@ -128,10 +107,7 @@ mod tests {
     use crate::database::types::DbRequest;
     use crate::database_processing;
     use crate::db_get;
-    use sled::{
-        Config,
-        Db,
-    };
+    use sled::{Config, Db};
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -158,23 +134,25 @@ mod tests {
         tokio::task::spawn(database_processing(db_rx, cache));
 
         // Call handle_reorg
-        let result = handle_reorg(&head_cache, 2, 3, db_tx.clone()).await;
+        let result = handle_reorg(&head_cache, 3, 2, db_tx.clone()).await;
 
         // Verify the result and check if the data is removed from the cache
         assert!(result.is_ok(), "handle_reorg failed");
-        let head_cache_guard = head_cache.read().expect("failed to read head cache");
-        assert!(
-            head_cache_guard.contains_key(&1),
-            "head cache does not contain key1"
-        );
-        assert!(
-            !head_cache_guard.contains_key(&2),
-            "head cache should not contain key2"
-        );
-        assert!(
-            !head_cache_guard.contains_key(&3),
-            "head cache should not contain key3"
-        );
+        {
+            let head_cache_guard = head_cache.read().expect("failed to read head cache");
+            assert!(
+                head_cache_guard.contains_key(&1),
+                "head cache does not contain key1"
+            );
+            assert!(
+                !head_cache_guard.contains_key(&2),
+                "head cache should not contain key2"
+            );
+            assert!(
+                !head_cache_guard.contains_key(&3),
+                "head cache should not contain key3"
+            );
+        }
 
         // Check if the data is removed from the cache
         let key1 = db_get!(db_tx.clone(), "key1".as_bytes()).unwrap();
@@ -210,6 +188,6 @@ mod tests {
         assert!(result.is_ok());
         let head_cache_guard = head_cache.read().unwrap();
         assert!(!head_cache_guard.contains_key(&1));
-        assert!(!head_cache_guard.contains_key(&2));
+        assert!(head_cache_guard.contains_key(&2));
     }
 }

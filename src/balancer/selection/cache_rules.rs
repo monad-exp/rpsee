@@ -1,9 +1,6 @@
 use memchr::memmem;
 
-use crate::{
-    balancer::format::NamedNumber,
-    rpc::method::EthRpcMethod,
-};
+use crate::{balancer::format::NamedNumber, rpc::method::EthRpcMethod};
 
 // Return true if we are supposed to be caching the input.
 //
@@ -11,8 +8,9 @@ use crate::{
 // overall be valid. Too bad!
 pub fn cache_method<M: AsRef<str>>(rx: M) -> bool {
     // If no-cache feature is on, return false
-    #[cfg(feature = "no-cache")]
-    return false;
+    if cfg!(feature = "no-cache") {
+        return false;
+    }
 
     // all of the below cannot be cached properly
     let blacklist = [
@@ -44,8 +42,9 @@ pub fn cache_method<M: AsRef<str>>(rx: M) -> bool {
 // Same as cache_method but for results
 pub fn cache_result(rx: &str) -> bool {
     // If no-cache feature is on, return false
-    #[cfg(feature = "no-cache")]
-    return false;
+    if cfg!(feature = "no-cache") {
+        return false;
+    }
 
     // just checking if `error` is present should be enough, but include the beggining error
     // codes juuuust to be extra safe

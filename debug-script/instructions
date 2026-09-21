@@ -2,27 +2,27 @@
 # counts instructions for a standard workload
 set -e
 
-OUTFILE="cachegrind.blutgang.`git describe --always --dirty`-`date +%s`"
-
-rm -rf default.sled || true
+OUTFILE="cachegrind.rpsee.$(git describe --always --dirty)-$(date +%s)"
+LAST=$(ls -t cachegrind.rpsee.* 2>/dev/null | head -1)
 
 CARGO_PROFILE_RELEASE_DEBUG=true \
 cargo build \
-  --bin=blutgang \
-  --release   \
-  --config example_config.toml
+  --bin=rpsee \
+  --release
 
-valgrind \
+status=0
+timeout 60s valgrind \
   --tool=cachegrind \
-  --cachegrind-out-file=$OUTFILE \
-  timeout 60s ./target/release/blutgang  --config example_config.toml 
+  --cachegrind-out-file="$OUTFILE" \
+  ./target/release/rpsee --config example_config.toml || status=$?
 
-LAST=`ls -t cachegrind.stress.* | sed -n 2p`
+if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
+    exit "$status"
+fi
 
-
-echo "Last cachegrind output: $LAST new file: $OUTFILE"
-
-echo "--------------------------------------------"
-echo "changes in instruction count"
-cg_annotate --diff $LAST $OUTFILE | tail -1
-
+if [ -n "$LAST" ]; then
+    echo "Last cachegrind output: $LAST new file: $OUTFILE"
+    cg_annotate --diff "$LAST" "$OUTFILE" | tail -1
+else
+    echo "Cachegrind output: $OUTFILE"
+fi

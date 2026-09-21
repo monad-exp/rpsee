@@ -6,35 +6,24 @@ use crate::{
     websocket::{
         client::execute_ws_call,
         error::WsError,
-        types::{
-            IncomingResponse,
-            RequestResult,
-            SubscriptionData,
-            WsconnMessage,
-        },
+        types::{IncomingResponse, RequestResult, SubscriptionData, WsconnMessage},
     },
 };
 
 use rand::random;
 
-use tokio::sync::{
-    broadcast,
-    mpsc,
-};
+use tokio::sync::{broadcast, mpsc};
 
-use simd_json::from_str;
+use simd_json::from_slice;
 
-use futures::{
-    sink::SinkExt,
-    stream::StreamExt,
-};
+use futures::{sink::SinkExt, stream::StreamExt};
 
 use hyper_tungstenite::HyperWebsocket;
 use tungstenite::Message;
 
 /// Handle a WebSocket connection request.
 ///
-/// Opens a WebSocket connection between Blutgang and a client,
+/// Opens a WebSocket connection between Rpsee and a client,
 /// sending their requests to be processed.
 pub async fn serve_websocket<K, V>(
     websocket: HyperWebsocket,
@@ -119,10 +108,10 @@ where
 
     while let Some(message) = websocket_stream.next().await {
         match message {
-            Ok(Message::Text(mut msg)) => {
-                tracing::info!(msg, "Received WS text message");
+            Ok(Message::Text(msg)) => {
+                tracing::info!(%msg, "Received WS text message");
                 // Send message to the channel
-                let rax = match unsafe { from_str(&mut msg) } {
+                let rax = match from_slice(&mut msg.as_bytes().to_vec()) {
                     Ok(rax) => rax,
                     Err(_) => continue,
                 };
@@ -149,5 +138,6 @@ where
         }
     }
 
+    sub_data.remove_user(user_id);
     Ok(())
 }

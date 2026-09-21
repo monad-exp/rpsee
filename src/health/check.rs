@@ -1,48 +1,25 @@
 use crate::{
-    admin::liveready::{
-        HealthState,
-        LiveReadyUpdate,
-        LiveReadyUpdateSnd,
-    },
+    IncomingResponse, Rpc, Settings, SubscriptionData,
+    admin::liveready::{HealthState, LiveReadyUpdate, LiveReadyUpdateSnd},
     health::{
         error::HealthError,
-        safe_block::{
-            get_safe_block,
-            NamedBlocknumbers,
-        },
+        safe_block::{NamedBlocknumbers, get_safe_block},
     },
     websocket::{
         subscription_manager::move_subscriptions,
-        types::{
-            WsChannelErr,
-            WsconnMessage,
-        },
+        types::{WsChannelErr, WsconnMessage},
     },
-    IncomingResponse,
-    Rpc,
-    Settings,
-    SubscriptionData,
 };
 
 use std::{
-    sync::{
-        Arc,
-        RwLock,
-    },
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
 use rust_tracing::deps::metrics;
 use tokio::{
-    sync::{
-        broadcast,
-        mpsc,
-        oneshot,
-    },
-    time::{
-        sleep,
-        timeout,
-    },
+    sync::{broadcast, mpsc, oneshot},
+    time::{sleep, timeout},
 };
 
 #[derive(Debug, Default)]
@@ -187,12 +164,10 @@ async fn head_check(
             let result = match result {
                 Ok(Ok(response)) => response,
                 // Handle timeout as failiure
-                Err(_) | Ok(Err(_)) => {
-                    InnerResult {
-                        is_syncing: true,
-                        reported_head: 0,
-                    }
-                }
+                Err(_) | Ok(Err(_)) => InnerResult {
+                    is_syncing: true,
+                    reported_head: 0,
+                },
             };
 
             let head_result = HeadResult {
@@ -320,16 +295,16 @@ fn escape_poverty(
     metrics::gauge!("rpc_health_ratio").set(healthy / total);
 
     //todo: i dont like this but its whatever
-    let to_send;
+
     let is_pov_empty = poverty_list_guard.is_empty();
     let is_rpc_empty = rpc_list_guard.is_empty();
-    if !is_rpc_empty && is_pov_empty {
-        to_send = LiveReadyUpdate::Health(HealthState::Healthy);
+    let to_send = if !is_rpc_empty && is_pov_empty {
+        LiveReadyUpdate::Health(HealthState::Healthy)
     } else if !is_pov_empty && !is_rpc_empty {
-        to_send = LiveReadyUpdate::Health(HealthState::MissingRpcs);
+        LiveReadyUpdate::Health(HealthState::MissingRpcs)
     } else {
-        to_send = LiveReadyUpdate::Health(HealthState::Unhealthy);
-    }
+        LiveReadyUpdate::Health(HealthState::Unhealthy)
+    };
 
     Ok(to_send)
 }
@@ -392,7 +367,7 @@ pub async fn dropped_listener(
             None => {
                 return Err(HealthError::InvalidResponse(
                     "Expected WsChannelErr!".to_string(),
-                ))
+                ));
             }
         };
     }
