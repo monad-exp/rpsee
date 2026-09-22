@@ -194,6 +194,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn same_height_reorg_removes_all_responses_after_parent_finalizes() {
+        for finalize_parent in [false, true] {
+            let head_cache = Arc::new(RwLock::new(BTreeMap::from([
+                (1, BTreeSet::from([b"parent".as_slice()])),
+                (2, BTreeSet::from([b"head_a".as_slice(), b"head_b"])),
+            ])));
+            let config = Config::tmp().unwrap();
+            let cache = Db::open_with_config(&config).unwrap();
+            for key in [b"parent".as_slice(), b"head_a", b"head_b"] {
+                cache.insert(key, b"cached response").unwrap();
+            }
+            let (db_tx, db_rx) = mpsc::unbounded_channel::<DbRequest<&[u8], &[u8]>>();
+            let worker = tokio::spawn(database_processing(db_rx, cache));
+
+            if finalize_parent {
+                remove_stale(&head_cache, 1).unwrap();
+            }
+            handle_reorg(&head_cache, 2, 2, db_tx.clone())
+                .await
+                .unwrap();
+
+            assert!(
+                db_get!(db_tx.clone(), b"parent".as_slice())
+                    .unwrap()
+                    .is_some()
+            );
+            for key in [b"head_a".as_slice(), b"head_b"] {
+                assert!(db_get!(db_tx.clone(), key).unwrap().is_none());
+            }
+            assert!(!head_cache.read().unwrap().contains_key(&2));
+            assert_eq!(
+                head_cache.read().unwrap().contains_key(&1),
+                !finalize_parent
+            );
+            drop(db_tx);
+            worker.await.unwrap();
+        }
+    }
+
     #[test]
     fn test_remove_stale() {
         // Create test data and resources
@@ -214,5 +255,17 @@ mod tests {
         let head_cache_guard = head_cache.read().unwrap();
         assert!(!head_cache_guard.contains_key(&1));
         assert!(head_cache_guard.contains_key(&2));
+    }
+
+    #[test]
+    fn finalizing_maximum_block_number_prunes_all_tracking() {
+        let head_cache = Arc::new(RwLock::new(BTreeMap::from([
+            (u64::MAX - 1, BTreeSet::from([b"parent".as_slice()])),
+            (u64::MAX, BTreeSet::from([b"head".as_slice()])),
+        ])));
+
+        remove_stale(&head_cache, u64::MAX).unwrap();
+
+        assert!(head_cache.read().unwrap().is_empty());
     }
 }
