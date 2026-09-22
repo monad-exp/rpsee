@@ -5,11 +5,10 @@ use crate::{
         processing::{CacheArgs, cache_query, hash_request, update_rpc_latency},
         selection::select::pick,
     },
-    cache_error,
     database::types::GenericBytes,
-    db_get, no_rpc_available, print_cache_error,
+    db_get,
     rpc::types::Rpc,
-    rpc_response, timed_out,
+    rpc_response,
     websocket::{
         server::serve_websocket,
         types::{IncomingResponse, SubscriptionData},
@@ -20,6 +19,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use serde_json::Value;
 
+use futures_util::{StreamExt, stream};
 use http_body_util::Full;
 use hyper::{Request, body::Bytes, header::HeaderValue};
 use hyper_tungstenite::{is_upgrade_request, upgrade};
@@ -58,6 +58,7 @@ impl ConnectionParams {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct RequestParams {
     pub ttl: u128,
     pub max_retries: u32,
@@ -122,212 +123,163 @@ macro_rules! accept {
     };
 }
 
-/// Macro for getting responses from either the cache or RPC nodes
-macro_rules! get_response {
-    (
-        $tx:expr,
-        $cache_args:expr,
-        $tx_hash:expr,
-        $rpc_position:expr,
-        $id:expr,
-        $con_params:expr,
-        $ttl:expr,
-        $max_retries:expr
-    ) => {
-        match db_get!($cache_args.cache, $tx_hash.as_bytes().to_owned().into()).map(|bytes| {
-            bytes.and_then(|mut bytes| {
-                simd_json::serde::from_slice::<Value>(&mut bytes)
-                    .ok()
-                    .filter(Value::is_object)
-            })
-        }) {
-            Ok(Some(mut cached)) => {
-                $rpc_position = None;
-                // Reconstruct ID
-                cached["id"] = $id.clone();
-                cached.to_string()
-            }
-            Ok(_) => {
-                fetch_from_rpc!(
-                    $tx,
-                    $cache_args,
-                    $tx_hash,
-                    $rpc_position,
-                    $id,
-                    $con_params,
-                    $ttl,
-                    $max_retries
-                )
-            }
-            Err(_) => {
-                // If anything errors send an rpc request and see if it works, if not then gg
-                print_cache_error!();
-                $rpc_position = None;
-                return (cache_error!($id.clone()), $rpc_position);
-            }
-        }
-    };
+fn response(status: u16, value: Option<Value>) -> hyper::Response<Full<Bytes>> {
+    hyper::Response::builder()
+        .status(if value.is_some() { status } else { 204 })
+        .header("Content-Type", "application/json")
+        .header("Access-Control-Allow-Origin", "*")
+        .body(Full::new(Bytes::from(
+            value.map(|value| value.to_string()).unwrap_or_default(),
+        )))
+        .unwrap()
 }
 
-macro_rules! fetch_from_rpc {
-    (
-        $tx:expr,
-        $cache_args:expr,
-        $tx_hash:expr,
-        $rpc_position:expr,
-        $id:expr,
-        $con_params:expr,
-        $ttl:expr,
-        $max_retries:expr
-    ) => {{
-        // Kinda jank but set the id back to what it was before
-        $tx["id"] = $id.clone();
-
-        // Loop until we get a response
-        let rx;
-        let mut retries = 0;
-        loop {
-            // Get the next Rpc in line.
-            let rpc;
-            {
-                let mut rpc_list_guard = $con_params.rpc_list.write().unwrap_or_else(|e| {
-                    // Handle the case where the RwLock is poisoned
-                    e.into_inner()
-                });
-
-                (rpc, $rpc_position) = pick(&mut rpc_list_guard);
-            }
-            tracing::info!(rpc.name, "Forwarding to");
-
-            // Check if we have any RPCs in the list, if not return error
-            if $rpc_position == None {
-                return (no_rpc_available!($id.clone()), None);
-            }
-
-            // Send the request. And return a timeout if it takes too long
-            //
-            // Check if it contains any errors or if its `latest` and insert it if it isn't
-            match timeout(
-                Duration::from_millis($ttl.try_into().unwrap()),
-                rpc.send_request($tx.clone()),
-            )
-            .await
-            {
-                Ok(Ok(response)) => {
-                    rx = response;
-                    break;
-                }
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "RPC request failed, retrying");
-                }
-                Err(_) => {
-                    tracing::warn!("An RPC request has timed out, picking new RPC and retrying.");
-                }
-            };
-
-            if retries >= $max_retries {
-                return (timed_out!($id.clone()), $rpc_position);
-            }
-            retries += 1;
-        }
-
-        // Don't cache responses that contain errors or missing trie nodes
-        cache_query(&rx, $tx, $tx_hash, &$cache_args).await;
-
-        rx
-    }};
+fn request_error(id: Value, code: i32, message: &str) -> Value {
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
-/// Pick RPC and send request to it. In case the result is cached,
-/// read and return from the cache.
-pub async fn forward_body<K, V>(
-    tx: Request<hyper::body::Incoming>,
-    con_params: &ConnectionParams,
-    cache_args: CacheArgs<K, V>,
+async fn forward_call<K, V>(
+    mut request: Value,
+    connection: &ConnectionParams,
+    cache: &CacheArgs<K, V>,
     params: RequestParams,
-) -> (
-    Result<hyper::Response<Full<Bytes>>, Infallible>,
-    Option<usize>,
-)
+) -> (u16, Option<Value>)
 where
     K: GenericBytes + From<[u8; 32]>,
     V: GenericBytes + From<Vec<u8>>,
 {
-    // TODO: do content type validation more upstream
-    // Check if body has application/json
-    //
-    // Can be toggled via the config. Should be on if we want rpsee to be JSON-RPC compliant.
+    if let Err(error) = validate_request(&request) {
+        return (400, Some(error));
+    }
+    let notification = request.get("id").is_none();
+    let id = request
+        .get_mut("id")
+        .map(Value::take)
+        .unwrap_or(Value::Null);
+    let mut request = replace_block_tags(&mut request, &cache.named_numbers);
+    let hash = hash_request(&request);
+
+    if !notification {
+        match db_get!(cache.cache, hash.as_bytes().to_owned().into()) {
+            Ok(Some(mut bytes)) => {
+                if let Ok(Value::Object(mut cached)) =
+                    simd_json::serde::from_slice::<Value>(&mut bytes)
+                {
+                    cached.insert("id".into(), id);
+                    return (200, Some(Value::Object(cached)));
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return (500, Some(request_error(id, -32003, "Cache error"))),
+        }
+        request["id"] = id.clone();
+    }
+
+    for attempt in 0..=params.max_retries {
+        let (rpc, position) = pick(
+            &mut connection
+                .rpc_list
+                .write()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        let Some(position) = position else {
+            return (
+                500,
+                (!notification).then(|| request_error(id, -32002, "No working RPC available")),
+            );
+        };
+        let started = Instant::now();
+        let result = timeout(
+            Duration::from_millis(params.ttl.try_into().unwrap()),
+            rpc.send_request(request.clone()),
+        )
+        .await;
+        update_rpc_latency(&connection.rpc_list, position, started.elapsed());
+        match result {
+            Ok(Ok(body)) => {
+                if notification {
+                    return (204, None);
+                }
+                let result = match serde_json::from_str::<Value>(&body) {
+                    Ok(value) if value.is_object() => value,
+                    _ => {
+                        return (
+                            502,
+                            Some(request_error(id, -32603, "Invalid upstream response")),
+                        );
+                    }
+                };
+                cache_query(&body, request, hash, cache).await;
+                return (200, Some(result));
+            }
+            Ok(Err(error)) => tracing::warn!(%error, "RPC request failed"),
+            Err(_) => tracing::warn!("RPC request timed out"),
+        }
+        if attempt == params.max_retries {
+            break;
+        }
+    }
+    (
+        408,
+        (!notification).then(|| request_error(id, -32001, "Request timed out")),
+    )
+}
+
+/// Process each batch member through the same routing and cache path as individual calls.
+pub async fn forward_body<K, V>(
+    tx: Request<hyper::body::Incoming>,
+    connection: &ConnectionParams,
+    cache: CacheArgs<K, V>,
+    params: RequestParams,
+) -> Result<hyper::Response<Full<Bytes>>, Infallible>
+where
+    K: GenericBytes + From<[u8; 32]>,
+    V: GenericBytes + From<Vec<u8>>,
+{
     if params.header_check
         && tx.headers().get("content-type") != Some(&HeaderValue::from_static("application/json"))
     {
-        return (
-            Ok(hyper::Response::builder()
-                .status(400)
-                .body(Full::new(Bytes::from("Improper content-type header")))
-                .unwrap()),
-            None,
-        );
+        return Ok(response(
+            400,
+            Some(request_error(
+                Value::Null,
+                -32600,
+                "Improper content-type header",
+            )),
+        ));
     }
-
     let request = match incoming_to_value(tx).await {
-        Ok(request) => validate_request(&request).map(|()| request),
-        Err(_) => Err(serde_json::json!({
-            "jsonrpc": "2.0", "id": null,
-            "error": { "code": -32700, "message": "Parse error" },
-        })),
-    };
-    let mut tx = match request {
         Ok(request) => request,
-        Err(error) => {
-            return (
-                Ok(hyper::Response::builder()
-                    .status(400)
-                    .header("Content-Type", "application/json")
-                    .body(Full::new(Bytes::from(error.to_string())))
-                    .unwrap()),
-                None,
-            );
+        Err(_) => {
+            return Ok(response(
+                400,
+                Some(request_error(Value::Null, -32700, "Parse error")),
+            ));
         }
     };
-
-    // Get the id of the request and set it to null for caching
-    //
-    // We're doing this ID gymnastics because we're hashing the
-    // whole request and we don't want the ID as it's arbitrary
-    // and does not impact the request result.
-    let id = tx["id"].take();
-
-    let mut tx = replace_block_tags(&mut tx, &cache_args.named_numbers);
-    let tx_hash = hash_request(&tx);
-    let mut rpc_position;
-
-    // Get the response from either the DB or from a RPC. If it timeouts, retry.
-    let rax = get_response!(
-        tx,
-        cache_args,
-        tx_hash,
-        rpc_position,
-        id,
-        con_params,
-        params.ttl,
-        params.max_retries
-    );
-
-    // Convert rx to bytes and but it in a Buf
-    let body = hyper::body::Bytes::from(rax);
-
-    // Put it in a http_body_util::Full
-    let body = Full::new(body);
-
-    // Build the response
-    let res = hyper::Response::builder()
-        .status(200)
-        .header("Content-Type", "application/json")
-        .header("Access-Control-Allow-Origin", "*")
-        .body(body)
-        .unwrap();
-
-    (Ok(res), rpc_position)
+    if let Value::Array(requests) = request {
+        if requests.is_empty() {
+            return Ok(response(
+                400,
+                Some(request_error(Value::Null, -32600, "Invalid Request")),
+            ));
+        }
+        let responses = stream::iter(
+            requests
+                .into_iter()
+                .map(|request| forward_call(request, connection, &cache, params)),
+        )
+        .buffered(16)
+        .filter_map(|(_, response)| async move { response })
+        .collect::<Vec<_>>()
+        .await;
+        return Ok(response(
+            200,
+            (!responses.is_empty()).then_some(Value::Array(responses)),
+        ));
+    }
+    let (status, value) = forward_call(request, connection, &cache, params).await;
+    Ok(response(status, value))
 }
 
 /// Forward the request to *a* RPC picked by the algo set by the user.
@@ -367,6 +319,15 @@ where
             }
         };
 
+        let ttl = Duration::from_millis(
+            connection_params
+                .config
+                .read()
+                .unwrap()
+                .ttl
+                .try_into()
+                .unwrap(),
+        );
         // Spawn a task to handle the websocket connection.
         tokio::task::spawn(async move {
             if let Err(e) = serve_websocket(
@@ -375,6 +336,7 @@ where
                 connection_params.channels.outgoing_rx,
                 connection_params.sub_data.clone(),
                 cache_args.to_owned(),
+                ttl,
             )
             .await
             {
@@ -386,10 +348,6 @@ where
         return Ok(response);
     }
 
-    // Send request
-    let response: Result<hyper::Response<Full<Bytes>>, Infallible>;
-    let rpc_position: Option<usize>;
-
     // RequestParams from config
     let params = {
         let config_guard = connection_params.config.read().unwrap();
@@ -400,26 +358,7 @@ where
         }
     };
 
-    // Check if we have the response hashed, and if not forward it
-    // to the best available RPC.
-    //
-    // Also handle cache insertions.
-    let time = Instant::now();
-    (response, rpc_position) = forward_body(tx, &connection_params, cache_args, params).await;
-
-    let time = time.elapsed();
-    tracing::info!(?time, "Request time");
-
-    // `rpc_position` is an Option<> that either contains the index of the RPC
-    // we forwarded our request to, or is None if the result was cached.
-    //
-    // Here, we update the latency of the RPC that was used to process the request
-    // if `rpc_position` is Some.
-    if let Some(rpc_position) = rpc_position {
-        update_rpc_latency(&connection_params.rpc_list, rpc_position, time);
-    }
-
-    response
+    forward_body(tx, &connection_params, cache_args, params).await
 }
 
 #[cfg(test)]
@@ -493,7 +432,7 @@ mod tests {
                             let request: Value = serde_json::from_slice(&body).unwrap();
                             let response = json!({
                                 "jsonrpc": "2.0", "id": request["id"],
-                                "result": format!("{}:\n\"quoted\"", request["params"][1].as_str().unwrap()),
+                                "result": format!("{}:\n\"quoted\"", request["params"][if request["method"] == "eth_getBlockByNumber" { 0 } else { 1 }].as_str().unwrap()),
                             });
                             Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(response.to_string()))))
                         }
@@ -506,19 +445,139 @@ mod tests {
         let rpc = Rpc::new(upstream_url.parse().unwrap(), None, 1, 0, 1.0);
         let (address, proxy_task) = proxy(rpc, cache_args.clone()).await;
         let client = reqwest::Client::new();
-        for (id, head, expected_calls) in [
-            (json!("first"), 16, 1),
-            (json!(-7), 16, 1),
-            (json!("third"), 17, 2),
-        ] {
-            cache_args.named_numbers.write().unwrap().latest = head;
-            let response: Value = client.post(&address).timeout(Duration::from_secs(5)).json(&json!({
-                "jsonrpc": "2.0", "id": id, "method": "eth_getBalance", "params": ["0x1", "latest"],
-            })).send().await.unwrap().json().await.unwrap();
-            assert_eq!(response["id"], id);
-            assert_eq!(response["result"], format!("0x{head:x}:\n\"quoted\""));
-            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+        for (case, (method, tag)) in [
+            ("eth_getBalance", "latest"),
+            ("eth_getBlockByNumber", "latest"),
+            ("eth_getBlockByNumber", "finalized"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (id, head, expected_calls) in [
+                (json!("first"), 16, 1),
+                (json!(-7), 16, 1),
+                (json!("third"), 17, 2),
+            ] {
+                {
+                    let mut named_numbers = cache_args.named_numbers.write().unwrap();
+                    named_numbers.latest = head + case as u64 * 10;
+                    named_numbers.finalized = named_numbers.latest;
+                }
+                let head = head + case as u64 * 10;
+                let params = if method == "eth_getBlockByNumber" {
+                    json!([tag, false])
+                } else {
+                    json!(["0x1", tag])
+                };
+                let response: Value = client
+                    .post(&address)
+                    .timeout(Duration::from_secs(5))
+                    .json(&json!({
+                        "jsonrpc": "2.0", "id": id, "method": method, "params": params,
+                    }))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(response["id"], id);
+                assert_eq!(response["result"], format!("0x{head:x}:\n\"quoted\""));
+                assert_eq!(calls.load(Ordering::SeqCst), case * 2 + expected_calls);
+            }
         }
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_batches_preserve_requests_omit_notifications_and_bound_concurrency() {
+        use http_body_util::BodyExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let (active_clone, peak_clone, notifications_clone) =
+            (active.clone(), peak.clone(), notifications.clone());
+        let upstream_task = tokio::spawn(async move {
+            while let Ok((stream, _)) = upstream.accept().await {
+                let (active, peak, notifications) = (
+                    active_clone.clone(),
+                    peak_clone.clone(),
+                    notifications_clone.clone(),
+                );
+                tokio::spawn(async move {
+                    http1::Builder::new().serve_connection(TokioIo::new(stream), service_fn(move |request: Request<hyper::body::Incoming>| {
+                        let (active, peak, notifications) = (active.clone(), peak.clone(), notifications.clone());
+                        async move {
+                            let request: Value = serde_json::from_slice(&request.collect().await.unwrap().to_bytes()).unwrap();
+                            peak.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            let value = if request.get("id").is_none() {
+                                notifications.fetch_add(1, Ordering::SeqCst);
+                                None
+                            } else {
+                                Some(json!({"jsonrpc":"2.0", "id":request["id"], "result":request["params"]}))
+                            };
+                            Ok::<_, Infallible>(response(200, value))
+                        }
+                    })).await.unwrap();
+                });
+            }
+        });
+        let rpc = Rpc::new(upstream_url.parse().unwrap(), None, 1, 0, 1.0);
+        let (address, proxy_task) = proxy(rpc, CacheArgs::default()).await;
+        let client = reqwest::Client::new();
+        let mut batch = vec![
+            json!({"jsonrpc":"2.0", "id":"estimate", "method":"eth_estimateGas", "params":[{"data":"0x1234"}]}),
+            json!({"jsonrpc":"2.0", "id":-7, "method":"eth_sendRawTransaction", "params":["0x1234"]}),
+            json!({"jsonrpc":"2.0", "id":null, "method":"eth_chainId", "params":[]}),
+            json!({"jsonrpc":"2.0", "method":"notify", "params":[]}),
+            json!(5),
+            json!([]),
+        ];
+        batch
+            .extend((0..32).map(
+                |id| json!({"jsonrpc":"2.0", "id":id, "method":"eth_chainId", "params":[id]}),
+            ));
+        let result: Value = client
+            .post(&address)
+            .timeout(Duration::from_secs(5))
+            .json(&batch)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let responses = result.as_array().unwrap();
+        assert_eq!(responses.len(), batch.len() - 1);
+        for (response, request) in responses
+            .iter()
+            .zip(batch.iter().filter(|request| request["method"] != "notify"))
+        {
+            if request.is_object() {
+                assert_eq!(response["id"], request["id"]);
+                assert_eq!(response["result"], request["params"]);
+            } else {
+                assert_eq!(response["error"]["code"], -32600);
+                assert!(response["id"].is_null());
+            }
+        }
+        assert!((2..=16).contains(&peak.load(Ordering::SeqCst)));
+        for payload in [
+            json!({"jsonrpc":"2.0", "method":"notify"}),
+            json!([{"jsonrpc":"2.0", "method":"notify"}, {"jsonrpc":"2.0", "method":"notify"}]),
+        ] {
+            let result = client.post(&address).json(&payload).send().await.unwrap();
+            assert_eq!(result.status(), 204);
+            assert!(result.bytes().await.unwrap().is_empty());
+        }
+        assert_eq!(notifications.load(Ordering::SeqCst), 4);
         proxy_task.abort();
         upstream_task.abort();
     }

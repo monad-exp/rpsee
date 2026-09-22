@@ -17,13 +17,13 @@ health_check = true
 # Enable content type header checking. Set this to `true` if you want
 # rpsee to be JSON-RPC compliant.
 header_check = true
-# Acceptable time to wait for a response in ms
-ttl = 30
+# Upstream request attempt timeout in ms, not a cache lifetime
+ttl = 5000
 # How many times to retry a request before giving up
 max_retries = 32
 # Block time in ms, used as a sanity check when not receiving subscriptions
 expected_block_time = 13000
-# Time between health checks in ms
+# Polling interval between health checks in ms, not a request timeout
 health_check_ttl = 400
 # Supress the health check running info messages
 supress_rpc_check = false
@@ -53,7 +53,7 @@ key = ""
 [rpsee.sled]
 # Path to db
 path = "./rpsee-cache-sled"
-# Cache size in bytes.
+# In-memory Sled cache budget in bytes; does not limit disk usage or process RSS.
 cache_capacity_bytes = 1000000000
 # zstd compression level
 zstd_compression_level = 1

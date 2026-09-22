@@ -5,6 +5,24 @@ use url::Url;
 
 use serde_json::{Value, json};
 
+struct RequestMetrics {
+    active: metrics::Gauge,
+    duration: metrics::Histogram,
+    errors: metrics::Counter,
+    started: std::time::Instant,
+    failed: bool,
+}
+
+impl Drop for RequestMetrics {
+    fn drop(&mut self) {
+        self.active.decrement(1);
+        self.duration.record(self.started.elapsed().as_secs_f64());
+        if self.failed {
+            self.errors.increment(1);
+        }
+    }
+}
+
 // All as floats so we have an easier time getting averages, stats and terminology copied from flood.
 #[derive(Debug, Clone, Default)]
 pub struct Status {
@@ -105,6 +123,10 @@ impl Rpc {
         }
     }
 
+    pub(crate) fn same_endpoint(&self, other: &Self) -> bool {
+        self.url == other.url && self.ws_url == other.ws_url
+    }
+
     /// Explicitly get the url of the Rpc, potentially dangerous as it can expose basic auth
     #[cfg(test)]
     pub fn get_url(&self) -> Url {
@@ -113,14 +135,33 @@ impl Rpc {
 
     /// Generic fn to send rpc
     pub async fn send_request(&self, tx: Value) -> Result<String, crate::rpc::types::RpcError> {
-        tracing::debug!("Sending request: {}", tx.clone());
+        let method = EthRpcMethod::try_from(tx["method"].as_str())
+            .map(|method| method.as_str())
+            .unwrap_or("other");
+        let labels = [
+            metrics::Label::new("method", method),
+            metrics::Label::new("rpc_name", self.name.clone()),
+        ];
+        let mut request_metrics = RequestMetrics {
+            active: metrics::gauge!("rpc_requests_active", labels.iter()),
+            duration: metrics::histogram!("rpc_response_time_secs", labels.iter()),
+            errors: metrics::counter!("rpc_requests_errors_total", labels.iter()),
+            started: std::time::Instant::now(),
+            // A dropped request future counts as a failed attempt.
+            failed: true,
+        };
+        request_metrics.active.increment(1);
+        metrics::counter!("rpc_requests_total", labels.iter()).increment(1);
+        tracing::debug!("Sending request: {}", tx);
 
         let response = match self.client.post(self.url.clone()).json(&tx).send().await {
             Ok(response) => response,
             Err(err) => return Err(RpcError::InvalidResponse(err.to_string())),
         };
 
+        let failed_status = !response.status().is_success();
         let resp_text = response.text().await;
+        request_metrics.failed = failed_status || resp_text.is_err();
         tracing::debug!("response: {:?}", resp_text);
 
         resp_text.map_err(From::from)
@@ -136,15 +177,7 @@ impl Rpc {
             "jsonrpc": "2.0".to_string(),
         });
 
-        metrics::gauge!("rpc_requests_active", "method" => method.as_str()).increment(1);
-        metrics::counter!("rpc_requests_total", "method" => method.as_str()).increment(1);
-
-        let req_start = std::time::Instant::now();
         let number = self.send_request(request).await;
-
-        metrics::histogram!("rpc_response_time_secs", "method" => method.as_str())
-            .record(req_start.elapsed().as_secs_f64());
-        metrics::gauge!("rpc_requests_active", "method" => method.as_str()).decrement(1);
 
         let return_number = extract_number(&number?)?;
 
@@ -161,15 +194,7 @@ impl Rpc {
             "jsonrpc": "2.0".to_string(),
         });
 
-        metrics::gauge!("rpc_requests_active", "method" => method.as_str()).increment(1);
-        metrics::counter!("rpc_requests_total", "method" => method.as_str()).increment(1);
-
-        let req_start = std::time::Instant::now();
         let sync = self.send_request(request).await;
-
-        metrics::histogram!("rpc_response_time_secs", "method" => method.as_str())
-            .record(req_start.elapsed().as_secs_f64());
-        metrics::gauge!("rpc_requests_active", "method" => method.as_str()).decrement(1);
 
         let status = extract_sync(&sync?)?;
 
@@ -186,15 +211,7 @@ impl Rpc {
             "jsonrpc": "2.0".to_string(),
         });
 
-        metrics::gauge!("rpc_requests_active", "method" => method.as_str()).increment(1);
-        metrics::counter!("rpc_requests_total", "method" => method.as_str()).increment(1);
-
-        let req_start = std::time::Instant::now();
         let resp = self.send_request(request).await;
-
-        metrics::histogram!("rpc_response_time_secs", "method" => method.as_str())
-            .record(req_start.elapsed().as_secs_f64());
-        metrics::gauge!("rpc_requests_active", "method" => method.as_str()).decrement(1);
 
         let number: Value = simd_json::serde::from_slice(&mut resp?.into_bytes())?;
         let number = &number["result"]["number"];

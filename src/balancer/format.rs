@@ -126,6 +126,9 @@ pub fn validate_request(request: &Value) -> Result<(), Value> {
     if request.is_object()
         && request["jsonrpc"] == "2.0"
         && request["method"].is_string()
+        && request
+            .get("params")
+            .is_none_or(|params| params.is_array() || params.is_object())
         && valid_id
     {
         return Ok(());

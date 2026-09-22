@@ -1,7 +1,7 @@
 use crate::{
     balancer::{
         format::{replace_block_tags, validate_request},
-        processing::{CacheArgs, cache_query, hash_request, update_rpc_latency},
+        processing::{CacheArgs, cache_query, hash_request},
         selection::select::pick,
     },
     database::types::GenericBytes,
@@ -25,22 +25,29 @@ use simd_json::from_slice;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
-/// Accepts incoming internal WS messages.
-///
-/// Upon receiving a `WsconnMessage::Reconnect()` it will drop all current WS
-/// connections and initiate new ones from the `rpc_list`.
+pub(crate) struct WsConnection {
+    rpc: Rpc,
+    sender: Option<mpsc::UnboundedSender<Value>>,
+}
+
+/// Routes requests to upstream WebSocket connections.
 pub async fn ws_conn_manager(
     rpc_list: Arc<RwLock<Vec<Rpc>>>,
-    ws_handles: Arc<RwLock<Vec<Option<mpsc::UnboundedSender<Value>>>>>,
+    ws_handles: Arc<RwLock<Vec<WsConnection>>>,
     mut incoming_rx: mpsc::UnboundedReceiver<WsconnMessage>,
     broadcast_tx: broadcast::Sender<IncomingResponse>,
     ws_error_tx: mpsc::UnboundedSender<WsChannelErr>,
+    ttl: u128,
 ) {
-    // Initialize WebSocket connections
-    update_ws_connections(&rpc_list, &ws_handles, &broadcast_tx, &ws_error_tx).await;
-
-    // Buffer for WS subscriptions when all nodes are ded
-    let mut ws_buffer: Vec<Value> = Vec::new();
+    let deadline = std::time::Duration::from_millis(u64::try_from(ttl).unwrap_or(u64::MAX));
+    update_ws_connections(
+        &rpc_list,
+        &ws_handles,
+        &broadcast_tx,
+        &ws_error_tx,
+        deadline,
+    )
+    .await;
 
     while let Some(message) = incoming_rx.recv().await {
         match message {
@@ -50,142 +57,151 @@ pub async fn ws_conn_manager(
                     &rpc_list,
                     incoming,
                     specified_index,
-                    &mut ws_buffer,
+                    &broadcast_tx,
+                );
+            }
+            WsconnMessage::Reconnect() => {
+                update_ws_connections(
+                    &rpc_list,
+                    &ws_handles,
+                    &broadcast_tx,
+                    &ws_error_tx,
+                    deadline,
                 )
                 .await;
             }
-            WsconnMessage::Reconnect() => {
-                update_ws_connections(&rpc_list, &ws_handles, &broadcast_tx, &ws_error_tx).await;
-                unload_buffer(&rpc_list, &ws_handles, &mut ws_buffer).await;
+        }
+    }
+    ws_handles.write().unwrap().clear();
+}
+
+async fn update_ws_connections(
+    rpc_list: &Arc<RwLock<Vec<Rpc>>>,
+    ws_handles: &Arc<RwLock<Vec<WsConnection>>>,
+    broadcast_tx: &broadcast::Sender<IncomingResponse>,
+    ws_error_tx: &mpsc::UnboundedSender<WsChannelErr>,
+    deadline: std::time::Duration,
+) {
+    let rpcs = rpc_list.read().unwrap().clone();
+    let mut reconnect = Vec::new();
+    {
+        let mut handles = ws_handles.write().unwrap();
+        for (index, connection) in handles.iter_mut().enumerate() {
+            if !rpcs.iter().any(|rpc| rpc.same_endpoint(&connection.rpc)) {
+                if connection
+                    .sender
+                    .as_ref()
+                    .is_some_and(|sender| !sender.is_closed())
+                {
+                    let _ = ws_error_tx.send(WsChannelErr::Closed(index, connection.rpc.clone()));
+                }
+                connection.sender = None;
             }
+        }
+        for rpc in rpcs {
+            let index = if let Some(index) = handles
+                .iter()
+                .position(|connection| connection.rpc.same_endpoint(&rpc))
+            {
+                index
+            } else {
+                handles.push(WsConnection {
+                    rpc: rpc.clone(),
+                    sender: None,
+                });
+                handles.len() - 1
+            };
+            if handles[index]
+                .sender
+                .as_ref()
+                .is_none_or(|sender| sender.is_closed())
+            {
+                reconnect.push((index, rpc));
+            }
+        }
+    }
+    let connections =
+        futures_util::future::join_all(reconnect.into_iter().map(|(index, rpc)| async move {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            let connected = ws_conn(
+                rpc.clone(),
+                rpc_list.clone(),
+                receiver,
+                broadcast_tx.clone(),
+                ws_error_tx.clone(),
+                index,
+                deadline,
+            )
+            .await;
+            (index, rpc, connected.then_some(sender))
+        }))
+        .await;
+    let rpcs = rpc_list.read().unwrap();
+    let mut handles = ws_handles.write().unwrap();
+    for (index, rpc, sender) in connections {
+        if rpcs.iter().any(|active| active.same_endpoint(&rpc)) {
+            handles[index].sender = sender;
         }
     }
 }
 
-/// Updates the active WS handles to match the active connections.
-async fn update_ws_connections(
-    rpc_list: &Arc<RwLock<Vec<Rpc>>>,
-    ws_handles: &Arc<RwLock<Vec<Option<mpsc::UnboundedSender<Value>>>>>,
-    broadcast_tx: &broadcast::Sender<IncomingResponse>,
-    ws_error_tx: &mpsc::UnboundedSender<WsChannelErr>,
-) {
-    let ws_vec = create_ws_vec(rpc_list, broadcast_tx, ws_error_tx).await;
-    let mut ws_handle_guard = ws_handles.write().unwrap_or_else(|e| {
-        // Handle the case where the ws_handles RwLock is poisoned
-        tracing::error!(?e);
-        e.into_inner()
-    });
-    *ws_handle_guard = ws_vec;
-}
-
-/// Dispatches buffered WS subscriptions out to nodes.
-async fn unload_buffer(
-    rpc_list: &Arc<RwLock<Vec<Rpc>>>,
-    ws_handles: &Arc<RwLock<Vec<Option<mpsc::UnboundedSender<Value>>>>>,
-    ws_buffer: &mut Vec<Value>,
-) {
-    for i in 0..ws_buffer.len() {
-        let incoming = ws_buffer[i].clone();
-        handle_incoming_message(ws_handles, rpc_list, incoming, None, ws_buffer).await;
-    }
-    ws_buffer.clear();
-}
-
-/// Sends an incoming request to a WS connection.
-///
-/// Indexes can be specified via the `specified_index` param.
-async fn handle_incoming_message(
-    ws_handles: &Arc<RwLock<Vec<Option<mpsc::UnboundedSender<Value>>>>>,
+fn handle_incoming_message(
+    ws_handles: &Arc<RwLock<Vec<WsConnection>>>,
     rpc_list: &Arc<RwLock<Vec<Rpc>>>,
     incoming: Value,
     specified_index: Option<usize>,
-    ws_buffer: &mut Vec<Value>,
-) {
-    let rpc_position = if let Some(index) = specified_index {
-        index
-    } else {
-        let mut rpc_list_guard = rpc_list.write().unwrap_or_else(|e| {
-            // Handle the case where the rpc_list RwLock is poisoned
-            tracing::error!(?e);
-            e.into_inner()
-        });
-
-        match pick(&mut rpc_list_guard).1 {
-            Some(position) => position,
-            None => {
-                // Check if the incoming content is a subscription.
-                //
-                // We do this because we want to send it to a buffer
-                // in case we have no available RPCs.
-                let method = &incoming["method"];
-                if method.eq(&EthRpcMethod::Subscription) || method.eq(&EthRpcMethod::Subscribe) {
-                    ws_buffer.push(incoming);
-                }
-                tracing::error!("No RPC position available");
-                return;
-            }
-        }
-    };
-
-    if let Some(ws) = ws_handles
-        .read()
-        .unwrap()
-        .get(rpc_position)
-        .and_then(|handle| handle.as_ref())
-    {
-        if ws.send(incoming).is_err() {
-            tracing::error!("ws_conn_manager error: failed to send message");
-        }
-    } else {
-        tracing::error!(rpc_position, "No WS connection at index");
-    }
-}
-
-/// Creates new WS connections off of RPCs in `rpc_list`.
-///
-/// Returns a Vec of channels that can be used to send values
-/// to different individual WS connections.
-pub async fn create_ws_vec(
-    rpc_list: &Arc<RwLock<Vec<Rpc>>>,
     broadcast_tx: &broadcast::Sender<IncomingResponse>,
-    ws_error_tx: &mpsc::UnboundedSender<WsChannelErr>,
-) -> Vec<Option<mpsc::UnboundedSender<Value>>> {
-    let rpc_list_clone = rpc_list
-        .read()
-        .unwrap_or_else(|e| {
-            // Handle the case where the rpc_list RwLock is poisoned
-            tracing::error!(?e);
-            e.into_inner()
-        })
-        .clone();
-    let mut ws_handles = Vec::new();
-
-    for (index, rpc) in rpc_list_clone.iter().enumerate() {
-        let (ws_conn_incoming_tx, ws_conn_incoming_rx) = mpsc::unbounded_channel();
-        ws_handles.push(Some(ws_conn_incoming_tx));
-        ws_conn(
-            rpc.clone(),
-            rpc_list.clone(),
-            ws_conn_incoming_rx,
-            broadcast_tx.clone(),
-            ws_error_tx.clone(),
-            index,
-        )
-        .await;
+) {
+    let rpc_position = specified_index.or_else(|| {
+        let mut rpcs = rpc_list.write().unwrap_or_else(|e| e.into_inner());
+        let handles = ws_handles.read().unwrap();
+        let positions: Vec<_> = rpcs
+            .iter()
+            .enumerate()
+            .filter_map(|(rpc_index, rpc)| {
+                handles
+                    .iter()
+                    .position(|connection| {
+                        connection.rpc.same_endpoint(rpc)
+                            && connection
+                                .sender
+                                .as_ref()
+                                .is_some_and(|sender| !sender.is_closed())
+                    })
+                    .map(|slot| (rpc_index, slot))
+            })
+            .collect();
+        let mut candidates: Vec<_> = positions
+            .iter()
+            .map(|(index, _)| rpcs[*index].clone())
+            .collect();
+        let selected = pick(&mut candidates).1;
+        for ((index, _), candidate) in positions.iter().zip(candidates) {
+            rpcs[*index] = candidate;
+        }
+        selected.map(|index| positions[index].1)
+    });
+    let sender = rpc_position.and_then(|index| {
+        ws_handles
+            .read()
+            .unwrap()
+            .get(index)
+            .and_then(|connection| connection.sender.clone())
+    });
+    let id = incoming["id"].clone();
+    if sender.is_some_and(|sender| sender.send(incoming).is_ok()) {
+        return;
     }
-
-    ws_handles
+    let _ = broadcast_tx.send(IncomingResponse {
+        node_id: rpc_position.unwrap_or(usize::MAX),
+        content: serde_json::json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": {"code": -32000, "message": "No upstream WebSocket connection available"},
+        }),
+    });
 }
 
-/// Represents a single WS connection to an RPC.
-///
-/// Accepts incoming requests via `incoming_rx` and send responses
-/// via `broadcast_tx`. Messages are *discovered* by their respective
-/// senders via the `"id"` field.
-///
-/// In case of an error where the connection is forced to close,
-/// a message will be sent via the `ws_error_tx` channel alerting
-/// the health check module.
+/// Owns both halves of a connection so replacing its sender closes the socket.
 pub async fn ws_conn(
     rpc: Rpc,
     rpc_list: Arc<RwLock<Vec<Rpc>>>,
@@ -193,82 +209,123 @@ pub async fn ws_conn(
     broadcast_tx: broadcast::Sender<IncomingResponse>,
     ws_error_tx: mpsc::UnboundedSender<WsChannelErr>,
     index: usize,
-) {
-    let ws_stream = match connect_async(rpc.ws_url.as_ref().unwrap().as_str()).await {
-        Ok((ws_stream, _)) => ws_stream,
-        Err(_) => {
-            tracing::error!(
-                "Node {} dropped their connection in the middle of WS init!",
-                rpc.name
+    deadline: std::time::Duration,
+) -> bool {
+    let Some(url) = rpc.ws_url.as_ref() else {
+        return false;
+    };
+    let mut stream = match tokio::time::timeout(deadline, connect_async(url.as_str())).await {
+        Ok(Ok((stream, _))) => stream,
+        _ => {
+            tracing::warn!(
+                rpc_name = rpc.name,
+                "Unable to connect to upstream WebSocket"
             );
-            return;
+            return false;
         }
     };
 
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-
-    // Thread for sending messages
-    let sender_error_tx = ws_error_tx.clone();
     tokio::spawn(async move {
-        while let Some(incoming) = incoming_rx.recv().await {
-            tracing::debug!("ws_conn[{}], send: {:?}", index, incoming);
-
-            if ws_sender
-                .send(Message::Text(incoming.to_string().into()))
-                .await
-                .is_err()
-            {
-                let _ = sender_error_tx.send(WsChannelErr::Closed(index));
-                break;
-            }
-        }
-    });
-
-    // Thread for receiving messages
-    tokio::spawn(async move {
-        while let Some(message) = ws_receiver.next().await {
-            match message {
-                Ok(message) => {
-                    let time = Instant::now();
-                    tracing::debug!("ws_conn[{}], recv: {:?}", index, message);
-
-                    let ws_message = match message.into_text() {
-                        Ok(rax) => rax,
-                        Err(e) => {
-                            tracing::error!(?e, "Received malformed message from ws_conn");
-                            let _ = ws_error_tx.send(WsChannelErr::Closed(index));
-                            break;
-                        }
-                    };
-
-                    let rax = match from_slice(&mut ws_message.as_bytes().to_vec()) {
-                        Ok(rax) => rax,
-                        Err(_e) => {
-                            {
-                                tracing::warn!(?_e, "Couldn't deserialize ws_conn response");
+        loop {
+            tokio::select! {
+                incoming = incoming_rx.recv() => {
+                    let Some(incoming) = incoming else { return; };
+                    if !matches!(tokio::time::timeout(deadline,
+                        stream.send(Message::Text(incoming.to_string().into()))).await, Ok(Ok(()))) {
+                        break;
+                    }
+                }
+                message = stream.next() => {
+                    let mut bytes = match message {
+                        Some(Ok(Message::Text(message))) => message.as_bytes().to_vec(),
+                        Some(Ok(Message::Binary(message))) => message.to_vec(),
+                        Some(Ok(Message::Ping(message))) => {
+                            if !matches!(tokio::time::timeout(deadline,
+                                stream.send(Message::Pong(message))).await, Ok(Ok(()))) {
+                                break;
                             }
-
+                            continue;
+                        }
+                        Some(Ok(Message::Pong(_))) => continue,
+                        _ => break,
+                    };
+                    let time = Instant::now();
+                    let content = match from_slice(&mut bytes) {
+                        Ok(content) => content,
+                        Err(error) => {
+                            tracing::warn!(?error, "Invalid upstream WebSocket JSON");
                             continue;
                         }
                     };
-
-                    let incoming = IncomingResponse {
-                        node_id: index,
-                        content: rax,
-                    };
-
-                    let _ = broadcast_tx.send(incoming);
-                    let time = time.elapsed();
-                    update_rpc_latency(&rpc_list, index, time);
-                    tracing::info!(?time, "WS request time");
-                }
-                Err(_) => {
-                    let _ = ws_error_tx.send(WsChannelErr::Closed(index));
-                    break;
+                    let _ = broadcast_tx.send(IncomingResponse { node_id: index, content });
+                    if let Some(active) = rpc_list.write().unwrap().iter_mut().find(|active| active.same_endpoint(&rpc)) {
+                        active.update_latency(time.elapsed().as_nanos() as f64);
+                    }
                 }
             }
         }
+        let _ = ws_error_tx.send(WsChannelErr::Closed(index, rpc));
     });
+    true
+}
+
+/// Execute batch members sequentially to keep per-connection request work bounded.
+pub async fn execute_ws_request<K, V>(
+    request: Value,
+    user_id: u32,
+    incoming_tx: &mpsc::UnboundedSender<WsconnMessage>,
+    broadcast_rx: broadcast::Receiver<IncomingResponse>,
+    sub_data: &Arc<SubscriptionData>,
+    cache_args: &CacheArgs<K, V>,
+    ttl: std::time::Duration,
+) -> Option<String>
+where
+    K: GenericBytes + From<[u8; 32]>,
+    V: GenericBytes + From<Vec<u8>>,
+{
+    let batch = request.is_array();
+    let requests = match request {
+        Value::Array(requests) if requests.is_empty() => {
+            return Some(serde_json::json!({"jsonrpc":"2.0", "id":null, "error":{"code":-32600, "message":"Invalid Request"}}).to_string());
+        }
+        Value::Array(requests) => requests,
+        request => vec![request],
+    };
+    let mut responses = Vec::new();
+    for call in requests {
+        let notification = validate_request(&call).is_ok() && call.get("id").is_none();
+        let id = call["id"].clone();
+        let result = tokio::time::timeout(
+            ttl,
+            execute_ws_call(
+                call,
+                user_id,
+                incoming_tx,
+                broadcast_rx.resubscribe(),
+                sub_data,
+                cache_args,
+            ),
+        )
+        .await;
+        if notification {
+            continue;
+        }
+        let response = match result {
+            Ok(Ok(response)) => serde_json::from_str(&response).unwrap_or_else(|_| {
+                serde_json::json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32603, "message":"Invalid upstream response"}})
+            }),
+            Ok(Err(error)) => serde_json::json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32603, "message":error.to_string()}}),
+            Err(_) => serde_json::json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32001, "message":"Request timed out"}}),
+        };
+        responses.push(response);
+    }
+    if responses.is_empty() {
+        None
+    } else if batch {
+        Some(Value::Array(responses).to_string())
+    } else {
+        Some(responses.remove(0).to_string())
+    }
 }
 
 /// Processes an individual RPC request received via WebSockets.
@@ -295,6 +352,16 @@ where
 
     if let Err(error) = validate_request(&call) {
         return Ok(error.to_string());
+    }
+    if call.get("id").is_none() {
+        if call["method"].eq(&EthRpcMethod::Unsubscribe) {
+            if let Some(subscription_id) = call["params"][0].as_str() {
+                sub_data.unsubscribe_user(user_id, subscription_id.to_owned());
+            }
+        } else {
+            incoming_tx.send(WsconnMessage::Message(call, None))?;
+        }
+        return Ok(String::new());
     }
     let id = call["id"].take();
     let is_subscription = call["method"].eq(&EthRpcMethod::Subscribe);
@@ -355,9 +422,12 @@ where
         }
     }
 
-    call["id"] = user_id.into();
+    static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(u32::MAX as u64 + 1);
+    let request_id = NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    call["id"] = request_id.into();
     incoming_tx.send(WsconnMessage::Message(call.clone(), None))?;
-    let mut response = listen_for_response(user_id, broadcast_rx).await?;
+    let mut response = listen_for_response(request_id, broadcast_rx).await?;
 
     if is_subscription {
         tracing::debug!("is subscription!");
@@ -384,13 +454,13 @@ where
     Ok(response.content.to_string())
 }
 
-/// Listens for a respond corresponding to our internal `user_id`.
+/// Wait for the response to this upstream request.
 async fn listen_for_response(
-    user_id: u32,
+    request_id: u64,
     mut broadcast_rx: broadcast::Receiver<IncomingResponse>,
 ) -> Result<IncomingResponse, WsError> {
     while let Ok(response) = broadcast_rx.recv().await {
-        if response.content["id"].as_u64().unwrap_or(u32::MAX.into()) as u32 == user_id {
+        if response.content["id"].as_u64() == Some(request_id) {
             return Ok(response);
         }
     }
@@ -465,18 +535,20 @@ mod tests {
     async fn test_handle_incoming_message() {
         let rpc_list = create_mock_rpc_list().await;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let ws_handles = Arc::new(RwLock::new(vec![Some(tx)]));
+        let ws_handles = Arc::new(RwLock::new(vec![WsConnection {
+            rpc: rpc_list.read().unwrap()[0].clone(),
+            sender: Some(tx),
+        }]));
         let incoming = json!({"type": "test"});
-        let mut ws_buffer: Vec<Value> = Vec::new();
+        let (broadcast_tx, _) = broadcast::channel(1);
 
         handle_incoming_message(
             &ws_handles,
             &rpc_list,
             incoming.clone(),
             Some(0),
-            &mut ws_buffer,
-        )
-        .await;
+            &broadcast_tx,
+        );
 
         // Check if the message was sent through the channel
         let received = rx.recv().await;
@@ -502,85 +574,80 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_ws_subscription_and_call() {
-        //
-        // Test subscriptions
-        //
-
-        let (incoming_tx, _incoming_rx) = mpsc::unbounded_channel();
+        let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
         let (broadcast_tx, broadcast_rx) = broadcast::channel(10);
         let sub_data = Arc::new(SubscriptionData::new());
         let cache_args = CacheArgs::default();
+        let upstream =
+            tokio::spawn(async move {
+                while let Some(WsconnMessage::Message(request, _)) = incoming_rx.recv().await {
+                    broadcast_tx.send(IncomingResponse {
+                    content: json!({"jsonrpc":"2.0", "id":request["id"], "result":"0x1a2b3c"}),
+                    node_id: 0,
+                }).unwrap();
+                }
+            });
+        for method in [EthRpcMethod::Subscribe, EthRpcMethod::BlockNumber] {
+            let result = execute_ws_call(
+                json!({"jsonrpc":"2.0", "id":1, "method":method, "params":["newHeads"]}),
+                1,
+                &incoming_tx,
+                broadcast_rx.resubscribe(),
+                &sub_data,
+                &cache_args,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result,
+                "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":\"0x1a2b3c\"}"
+            );
+        }
+        upstream.abort();
+    }
 
-        let call = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": EthRpcMethod::Subscribe,
-            "params": ["newHeads"]
-        });
-
-        // Simulate a response
-        let b_clone = broadcast_tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let response = IncomingResponse {
-                content: json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "result": "0x1a2b3c"
-                }),
-                node_id: 0,
+    #[tokio::test]
+    async fn batch_timeout_does_not_misroute_a_late_response() {
+        let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
+        let (broadcast_tx, broadcast_rx) = broadcast::channel(10);
+        let upstream = tokio::spawn(async move {
+            let Some(WsconnMessage::Message(first, _)) = incoming_rx.recv().await else {
+                panic!("first request missing")
             };
-            b_clone.send(response).unwrap();
+            let Some(WsconnMessage::Message(second, _)) = incoming_rx.recv().await else {
+                panic!("second request missing")
+            };
+            assert_ne!(first["id"], second["id"]);
+            for (request, result) in [(first, "late"), (second, "current")] {
+                broadcast_tx
+                    .send(IncomingResponse {
+                        node_id: 0,
+                        content: json!({"jsonrpc":"2.0", "id":request["id"], "result":result}),
+                    })
+                    .unwrap();
+            }
         });
-
-        let result = execute_ws_call(
-            call,
+        let batch = json!([
+            {"jsonrpc":"2.0", "id":"first", "method":"eth_chainId"},
+            {"jsonrpc":"2.0", "id":"second", "method":"eth_chainId"}
+        ]);
+        let response = execute_ws_request(
+            batch,
             1,
             &incoming_tx,
-            broadcast_rx.resubscribe(),
-            &sub_data,
-            &cache_args,
+            broadcast_rx,
+            &Arc::new(SubscriptionData::new()),
+            &CacheArgs::default(),
+            Duration::from_millis(50),
         )
-        .await;
-
-        assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":\"0x1a2b3c\"}"
-        );
-
-        //
-        // Test calls
-        //
-
-        let call = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": EthRpcMethod::BlockNumber,
-        });
-
-        // Simulate a response
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let response = IncomingResponse {
-                content: json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "result": "0x1a2b3c"
-                }),
-                node_id: 0,
-            };
-            broadcast_tx.send(response).unwrap();
-        });
-
-        let result =
-            execute_ws_call(call, 1, &incoming_tx, broadcast_rx, &sub_data, &cache_args).await;
-
-        assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":\"0x1a2b3c\"}"
-        );
+        .await
+        .unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response[0]["id"], "first");
+        assert_eq!(response[0]["error"]["code"], -32001);
+        assert_eq!(response[1]["id"], "second");
+        assert_eq!(response[1]["result"], "current");
+        upstream.await.unwrap();
     }
 
     #[tokio::test]
@@ -690,5 +757,258 @@ mod tests {
                 "result": "0x1a2b3c"
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio::{io::AsyncReadExt, net::TcpListener, time::timeout};
+
+    #[tokio::test]
+    async fn stalled_handshake_is_cancelled_and_socket_is_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            assert!(socket.read(&mut buffer).await.unwrap() > 0);
+            while socket.read(&mut buffer).await.unwrap() > 0 {}
+        });
+        let rpc = Rpc::new(
+            format!("http://{address}").parse().unwrap(),
+            Some(format!("ws://{address}").parse().unwrap()),
+            1,
+            0,
+            1.0,
+        );
+        let rpcs = Arc::new(RwLock::new(vec![rpc]));
+        let (responses, _) = broadcast::channel(1);
+        let (errors, _) = mpsc::unbounded_channel();
+        let handles = Arc::new(RwLock::new(Vec::new()));
+        update_ws_connections(
+            &rpcs,
+            &handles,
+            &responses,
+            &errors,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(handles.read().unwrap()[0].sender.is_none());
+        timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn replacing_sender_closes_socket_after_ping_and_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = tokio_tungstenite::accept_async(socket).await.unwrap();
+            stream.send(Message::Ping(vec![1].into())).await.unwrap();
+            assert_eq!(
+                stream.next().await.unwrap().unwrap(),
+                Message::Pong(vec![1].into())
+            );
+            stream
+                .send(Message::Text(
+                    json!({"jsonrpc": "2.0", "id": 7, "result": true})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            loop {
+                match stream.next().await {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                    _ => {}
+                }
+            }
+        });
+        let rpc = Rpc::new(
+            format!("http://{address}").parse().unwrap(),
+            Some(format!("ws://{address}").parse().unwrap()),
+            1,
+            0,
+            1.0,
+        );
+        let rpcs = Arc::new(RwLock::new(vec![rpc]));
+        let (responses, mut received) = broadcast::channel(1);
+        let (errors, _errors_rx) = mpsc::unbounded_channel();
+        let handles = Arc::new(RwLock::new(Vec::new()));
+        update_ws_connections(&rpcs, &handles, &responses, &errors, Duration::from_secs(1)).await;
+        assert!(handles.read().unwrap()[0].sender.is_some());
+        let response = timeout(Duration::from_secs(2), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.content["id"], 7);
+        drop(handles);
+        timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_preserves_healthy_subscription_and_stable_slot() {
+        let failed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let failed_address = failed_listener.local_addr().unwrap();
+        let failed_server = tokio::spawn(async move {
+            let (socket, _) = failed_listener.accept().await.unwrap();
+            let mut stream = tokio_tungstenite::accept_async(socket).await.unwrap();
+            assert!(!matches!(stream.next().await, Some(Ok(Message::Text(_)))));
+        });
+        let healthy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthy_address = healthy_listener.local_addr().unwrap();
+        let healthy_server = tokio::spawn(async move {
+            let (socket, _) = healthy_listener.accept().await.unwrap();
+            let mut stream = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let subscribe = stream.next().await.unwrap().unwrap().into_text().unwrap();
+            let subscribe: Value = serde_json::from_str(&subscribe).unwrap();
+            assert_eq!(subscribe["method"], "eth_subscribe");
+            stream
+                .send(Message::Text(
+                    json!({"jsonrpc":"2.0", "id":subscribe["id"], "result":"healthy-sub"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let next_request = stream.next().await.unwrap().unwrap().into_text().unwrap();
+            let next_request: Value = serde_json::from_str(&next_request).unwrap();
+            assert_eq!(next_request["id"], 8);
+            stream.send(Message::Text(json!({"jsonrpc":"2.0", "method":"eth_subscription", "params":{"subscription":"healthy-sub", "result":"after-reconnect"}}).to_string().into())).await.unwrap();
+            assert!(!matches!(stream.next().await, Some(Ok(Message::Text(_)))));
+        });
+        let rpcs = Arc::new(RwLock::new(
+            [failed_address, healthy_address]
+                .map(|address| {
+                    Rpc::new(
+                        format!("http://{address}").parse().unwrap(),
+                        Some(format!("ws://{address}").parse().unwrap()),
+                        1,
+                        0,
+                        1.0,
+                    )
+                })
+                .to_vec(),
+        ));
+        let (responses, mut received) = broadcast::channel(4);
+        let (errors, _errors_rx) = mpsc::unbounded_channel();
+        let handles = Arc::new(RwLock::new(Vec::new()));
+        update_ws_connections(&rpcs, &handles, &responses, &errors, Duration::from_secs(1)).await;
+        let request =
+            json!({"jsonrpc":"2.0", "id":7, "method":"eth_subscribe", "params":["newHeads"]});
+        handle_incoming_message(&handles, &rpcs, request.clone(), Some(1), &responses);
+        let subscribed = timeout(Duration::from_secs(2), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(subscribed.node_id, 1);
+        assert_eq!(subscribed.content["result"], "healthy-sub");
+        let subscriptions = SubscriptionData::new();
+        let (user_tx, mut user_rx) = mpsc::unbounded_channel();
+        subscriptions.add_user(1, user_tx);
+        subscriptions.register_subscription(request.clone(), "healthy-sub".to_owned(), 1);
+        subscriptions.subscribe_user(1, request).unwrap();
+        let healthy_sender = handles.read().unwrap()[1].sender.clone().unwrap();
+
+        rpcs.write().unwrap().remove(0);
+        update_ws_connections(&rpcs, &handles, &responses, &errors, Duration::from_secs(1)).await;
+        assert!(handles.read().unwrap()[0].sender.is_none());
+        assert!(
+            handles.read().unwrap()[1]
+                .sender
+                .as_ref()
+                .unwrap()
+                .same_channel(&healthy_sender)
+        );
+        timeout(Duration::from_secs(2), failed_server)
+            .await
+            .unwrap()
+            .unwrap();
+        handle_incoming_message(
+            &handles,
+            &rpcs,
+            json!({"jsonrpc":"2.0", "id":8, "method":"eth_blockNumber"}),
+            None,
+            &responses,
+        );
+        let notification = timeout(Duration::from_secs(2), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(notification.node_id, 1);
+        subscriptions
+            .dispatch_to_subscribers(
+                "healthy-sub",
+                notification.node_id,
+                &crate::websocket::types::RequestResult::Subscription(notification.content),
+            )
+            .await
+            .unwrap();
+        let notification: Value = timeout(Duration::from_secs(2), user_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        assert_eq!(notification["params"]["subscription"], "healthy-sub");
+        assert_eq!(notification["params"]["result"], "after-reconnect");
+        drop(healthy_sender);
+        drop(handles);
+        timeout(Duration::from_secs(2), healthy_server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unavailable_upstream_returns_error_without_buffering_subscriptions() {
+        let rpcs = Arc::new(RwLock::new(Vec::new()));
+        let handles = Arc::new(RwLock::new(Vec::new()));
+        let (responses, mut received) = broadcast::channel(1);
+        handle_incoming_message(
+            &handles,
+            &rpcs,
+            json!({"jsonrpc": "2.0", "id": 7, "method": "eth_subscribe", "params": ["newHeads"]}),
+            None,
+            &responses,
+        );
+        let response = received.recv().await.unwrap();
+        assert_eq!(response.content["id"], 7);
+        assert_eq!(response.content["error"]["code"], -32000);
+    }
+
+    #[tokio::test]
+    async fn requests_skip_endpoints_without_live_websockets() {
+        let failed = Rpc::new("http://localhost/failed".parse().unwrap(), None, 1, 0, 1.0);
+        let healthy = Rpc::new("http://localhost/healthy".parse().unwrap(), None, 1, 0, 1.0);
+        let rpcs = Arc::new(RwLock::new(vec![failed.clone(), healthy.clone()]));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let handles = Arc::new(RwLock::new(vec![
+            WsConnection {
+                rpc: failed,
+                sender: None,
+            },
+            WsConnection {
+                rpc: healthy,
+                sender: Some(sender),
+            },
+        ]));
+        let (responses, mut errors) = broadcast::channel(1);
+        let request = json!({"jsonrpc":"2.0", "id":7, "method":"eth_blockNumber"});
+        handle_incoming_message(&handles, &rpcs, request.clone(), None, &responses);
+        assert_eq!(receiver.try_recv().unwrap(), request);
+        assert!(errors.try_recv().is_err());
+        assert_eq!(rpcs.read().unwrap().len(), 2);
+        drop(receiver);
+        handle_incoming_message(&handles, &rpcs, request, None, &responses);
+        assert_eq!(errors.try_recv().unwrap().content["error"]["code"], -32000);
     }
 }

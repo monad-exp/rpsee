@@ -1,5 +1,5 @@
 use crate::{
-    config::system::{MAGIC, WS_SUB_MANAGER_ID},
+    config::system::WS_SUB_MANAGER_ID,
     rpc::method::EthRpcMethod,
     websocket::{
         error::WsError,
@@ -7,7 +7,14 @@ use crate::{
     },
 };
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use tokio::sync::{
     broadcast::{self, error::RecvError},
@@ -80,6 +87,7 @@ pub async fn move_subscriptions(
     mut rx: broadcast::Receiver<IncomingResponse>,
     sub_data: &Arc<SubscriptionData>,
     node_id: usize,
+    ttl: Duration,
 ) -> Result<(), WsError> {
     // Collect all subscriptions/ids we have assigned to `node_id` and put them in a vec
     let subs = sub_data.get_subscription_by_node(node_id);
@@ -92,46 +100,32 @@ pub async fn move_subscriptions(
         let _ = incoming_tx.send(message);
     }
 
-    // We want to send subscription messages to `target`, register them, and move over the users
-    let _ = rx; // bind `rx` so we have time to process all messages
-    let mut pairs: HashMap<u32, String> = HashMap::new();
-    let mut id = WS_SUB_MANAGER_ID + MAGIC;
+    static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1 << 63);
+    let mut pairs = HashMap::new();
     for params in subs {
-        id += 1;
-        let sub = json!({"jsonrpc": "2.0", "id": id, "method": EthRpcMethod::Subscribe, "params": vec![params.clone()]});
-        let message = WsconnMessage::Message(sub, None);
-
+        let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&params).map_err(|_| WsError::FailedParsing())?;
+        let sub = json!({"jsonrpc": "2.0", "id": id, "method": EthRpcMethod::Subscribe, "params": parsed});
         pairs.insert(id, params);
-
-        let _ = incoming_tx.send(message);
+        incoming_tx.send(WsconnMessage::Message(sub, None))?;
     }
 
-    // Listen on `rx` for incoming messages.
-    // We're only interested in ones that have the right ID as specified in pairs
+    let deadline = tokio::time::Instant::now() + ttl;
     while !pairs.is_empty() {
-        let response = rx.recv().await?;
-
-        // Discard any response that does not have a proper ID
-        let pair_id = match response.content["id"].as_u64() {
-            Some(rax) => rax as u32,
-            None => return Err(WsError::NoIdInResponse(response.content.to_string())),
+        let response = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .map_err(|_| WsError::NoWsResponse)??;
+        let Some(pair_id) = response.content["id"].as_u64() else {
+            continue;
         };
-
-        let params = match pairs.get(&pair_id) {
-            Some(rax) => rax.to_string(),
-            None => continue,
+        let Some(params) = pairs.remove(&pair_id) else {
+            continue;
         };
-
-        let sub_id = match sub_data.get_sub_id_by_params(&params) {
-            Some(rax) => rax,
-            None => return Err(WsError::MissingSubscription()),
-        };
-        match sub_data.move_subscriptions(response.node_id, params, sub_id) {
-            Ok(_) => {}
-            Err(err) => return Err(err),
-        };
-
-        pairs.remove(&pair_id);
+        let sub_id = response.content["result"]
+            .as_str()
+            .ok_or_else(|| WsError::InvalidData("Upstream rejected subscription".to_string()))?;
+        sub_data.move_subscriptions(response.node_id, params, sub_id.to_string())?;
     }
 
     Ok(())
@@ -209,7 +203,7 @@ mod tests {
         tokio::spawn(async move {
             while let Some(WsconnMessage::Message(message, _)) = incoming_rx.recv().await {
                 if message["method"].eq(&EthRpcMethod::Subscribe) {
-                    let id = message["id"].as_u64().unwrap() as u32;
+                    let id = message["id"].as_u64().unwrap();
                     let random_result = rand::random::<u64>().to_string();
                     let mock_response = IncomingResponse {
                         content: json!({"jsonrpc": "2.0", "id": id, "result": random_result}),
@@ -222,8 +216,14 @@ mod tests {
         });
 
         // Execute move_subscriptions
-        let move_result =
-            move_subscriptions(&incoming_tx, rx, &Arc::clone(&sub_data), node_id).await;
+        let move_result = move_subscriptions(
+            &incoming_tx,
+            rx,
+            &Arc::clone(&sub_data),
+            node_id,
+            Duration::from_secs(1),
+        )
+        .await;
         assert!(move_result.is_ok(), "move_subscriptions should succeed");
 
         // Verify the mock responses have been processed and subscriptions moved
@@ -238,5 +238,122 @@ mod tests {
             !moved_subs.is_empty(),
             "Subscriptions should have been moved to the new node"
         );
+    }
+    #[tokio::test]
+    async fn migration_preserves_filter_and_uses_new_upstream_subscription_id() {
+        let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
+        let (responses, response_rx) = broadcast::channel(4);
+        let subscriptions = Arc::new(SubscriptionData::new());
+        let (user_tx, mut user_rx) = mpsc::unbounded_channel();
+        subscriptions.add_user(1, user_tx);
+        let params = json!(["logs", {"address": "0x1234", "topics": []}]);
+        let request = json!({"params": params});
+        subscriptions.register_subscription(request.clone(), "old".to_string(), 1);
+        subscriptions.subscribe_user(1, request).unwrap();
+        let upstream = tokio::spawn(async move {
+            while let Some(WsconnMessage::Message(message, _)) = incoming_rx.recv().await {
+                if message["method"] != "eth_subscribe" {
+                    continue;
+                }
+                assert_eq!(message["params"], params);
+                responses
+                    .send(IncomingResponse {
+                        node_id: 3,
+                        content: json!({"method": "eth_subscription", "params": {}}),
+                    })
+                    .unwrap();
+                responses
+                    .send(IncomingResponse {
+                        node_id: 2,
+                        content: json!({"id": message["id"], "result": "new"}),
+                    })
+                    .unwrap();
+                return;
+            }
+        });
+        move_subscriptions(
+            &incoming_tx,
+            response_rx,
+            &subscriptions,
+            1,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        upstream.await.unwrap();
+        assert!(subscriptions.get_sub_id_by_node(1).is_empty());
+        assert_eq!(subscriptions.get_sub_id_by_node(2), vec!["new"]);
+        assert!(subscriptions.get_users_for_subscription("old").is_empty());
+        let notification = json!({"params": {"subscription": "new", "result": "event"}});
+        subscriptions
+            .dispatch_to_subscribers("new", 2, &RequestResult::Subscription(notification.clone()))
+            .await
+            .unwrap();
+        match user_rx.recv().await.unwrap() {
+            RequestResult::Subscription(message) => {
+                assert_eq!(message["params"]["subscription"], "old");
+                assert_eq!(message["params"]["result"], "event");
+            }
+            _ => panic!("expected migrated notification"),
+        }
+        assert_eq!(subscriptions.get_node_from_id("old"), Some(2));
+        assert_eq!(
+            subscriptions
+                .subscribe_user(
+                    2,
+                    json!({"params":["logs", {"address":"0x1234", "topics":[]}]})
+                )
+                .unwrap(),
+            "old"
+        );
+        let (_responses, response_rx) = broadcast::channel(1);
+        let unsubscribe = crate::websocket::client::execute_ws_call(
+            json!({"jsonrpc":"2.0", "id":17, "method":"eth_unsubscribe", "params":["old"]}),
+            1,
+            &incoming_tx,
+            response_rx,
+            &subscriptions,
+            &crate::balancer::processing::CacheArgs::default(),
+        )
+        .await
+        .unwrap();
+        let unsubscribe: serde_json::Value = serde_json::from_str(&unsubscribe).unwrap();
+        assert_eq!(
+            unsubscribe,
+            json!({"jsonrpc":"2.0", "id":17, "result":true})
+        );
+        subscriptions.unsubscribe_user(2, "old".to_owned());
+        assert!(
+            subscriptions
+                .dispatch_to_subscribers("new", 2, &RequestResult::Subscription(notification))
+                .await
+                .unwrap()
+        );
+        assert!(user_rx.try_recv().is_err());
+        assert_eq!(subscriptions.get_node_from_id("old"), None);
+    }
+
+    #[tokio::test]
+    async fn unanswered_migration_times_out_without_losing_subscribers() {
+        let (incoming_tx, _incoming_rx) = mpsc::unbounded_channel();
+        let (_responses, response_rx) = broadcast::channel(1);
+        let subscriptions = Arc::new(SubscriptionData::new());
+        let request = json!({"params": ["newHeads"]});
+        subscriptions.register_subscription(request.clone(), "old".to_string(), 1);
+        subscriptions.subscribe_user(7, request).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            move_subscriptions(
+                &incoming_tx,
+                response_rx,
+                &subscriptions,
+                1,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(WsError::NoWsResponse)));
+        assert_eq!(subscriptions.get_users_for_subscription("old"), vec![7]);
     }
 }

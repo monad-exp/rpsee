@@ -2,6 +2,8 @@
 
 rpsee is a caching load balancer for Ethereum JSON-RPC over HTTP and WebSocket. It is based on [Blutgang](https://github.com/rainshowerLabs/blutgang) by Rainshower Labs and its contributors.
 
+Both transports support JSON-RPC batches, preserve request IDs, and omit responses for notifications. HTTP requests containing only notifications return status 204.
+
 ## Build and run
 
 Install [Rust through rustup](https://rustup.rs/). The repository pins the Rust toolchain used by CI and Docker.
@@ -42,6 +44,22 @@ cargo build --release --locked --no-default-features --features rocksdb,selectio
 ```
 
 Set `db` in the configuration to a backend enabled in your build.
+
+Sled's `cache_capacity_bytes` controls its in-memory cache budget. It does not cap total process memory or database disk usage. Cached historical responses persist on disk; rpsee does not impose a disk quota. Size the cache volume separately from the memory limit. The `ttl` setting is the timeout for each upstream request attempt in milliseconds, not a cache lifetime; `health_check_ttl` is the health-check polling interval.
+
+### Metrics and logging
+
+Enable structured application logs and choose a Prometheus port with environment variables:
+
+```bash
+RUST_LOG=info TRACING_LOG_JSON=true TRACING_METRICS_PORT=9000 \
+  rpsee --config config.toml
+curl http://127.0.0.1:9000/metrics
+```
+
+Unset `TRACING_LOG_JSON` to use text logs. The metrics listener binds to `0.0.0.0:9000` by default. When using Docker, publish this port separately if needed, for example with `-p 127.0.0.1:9000:9000`.
+
+Metrics cover cache hits and misses, RPC health, WebSocket subscriptions, and upstream HTTP attempts. `rpc_requests_total`, `rpc_requests_active`, `rpc_response_time_secs`, and `rpc_requests_errors_total` carry `rpc_name` and `method` labels. Unrecognized methods share the `other` label to bound metric cardinality. Errors include transport failures, unsuccessful HTTP statuses, and cancelled attempts such as timeouts; JSON-RPC errors inside successful HTTP responses are not counted. Cache hits do not make upstream attempts.
 
 ### Optimized build
 

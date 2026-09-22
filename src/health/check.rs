@@ -16,21 +16,16 @@ use std::{
     time::Duration,
 };
 
+use futures_util::future::join_all;
 use rust_tracing::deps::metrics;
 use tokio::{
-    sync::{broadcast, mpsc, oneshot},
+    sync::{broadcast, mpsc},
     time::{sleep, timeout},
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 struct HeadResult {
-    rpc_list_index: usize,
-    is_syncing: bool,
-    reported_head: u64,
-}
-
-#[derive(Debug)]
-struct InnerResult {
+    rpc: Rpc,
     is_syncing: bool,
     reported_head: u64,
 }
@@ -64,7 +59,7 @@ pub async fn health_check(
             &rpc_list,
             &finalized_tx,
             named_numbers_rwlock,
-            health_check_ttl,
+            u64::try_from(ttl).unwrap_or(u64::MAX),
         )
         .await?;
     }
@@ -113,91 +108,22 @@ async fn head_check(
     rpc_list: &Arc<RwLock<Vec<Rpc>>>,
     ttl: u128,
 ) -> Result<Vec<HeadResult>, HealthError> {
-    let len;
-    let rpc_list_clone;
-    {
-        let rpc_list_guard = rpc_list.read().unwrap_or_else(|e| {
-            // Handle the case where the RwLock is poisoned
-            e.into_inner()
-        });
-
-        len = rpc_list_guard.len();
-        rpc_list_clone = rpc_list_guard.clone();
-    }
-    let mut heads = Vec::<HeadResult>::new();
-
-    // If len == 0 return empty Vec
-    if len == 0 {
-        return Ok(heads);
-    }
-
-    // Create a vector to store the futures of all RPC requests
-    let mut rpc_futures = Vec::new();
-
-    // Create a channel for collecting results
-    let (tx, mut rx) = mpsc::channel(len);
-
-    // Iterate over all RPCs
-    for (rpc_list_index, rpc) in rpc_list_clone.into_iter().enumerate().take(len) {
-        let tx = tx.clone(); // Clone the sender for this RPC
-
-        // Spawn a future for each RPC
-        let rpc_future = async move {
-            let (send_tx, send_rx) = oneshot::channel();
-
-            // Check the current block number
-            let a = async move {
-                let block_number = rpc.block_number().await.unwrap_or(0);
-                let syncing = rpc.syncing().await.unwrap_or(true);
-
-                let rax = InnerResult {
-                    is_syncing: syncing,
-                    reported_head: block_number,
-                };
-
-                let _ = send_tx.send(rax);
-            };
-            tokio::spawn(a);
-
-            let result = timeout(Duration::from_millis(ttl.try_into().unwrap()), send_rx).await;
-
-            let result = match result {
-                Ok(Ok(response)) => response,
-                // Handle timeout as failiure
-                Err(_) | Ok(Err(_)) => InnerResult {
-                    is_syncing: true,
-                    reported_head: 0,
-                },
-            };
-
-            let head_result = HeadResult {
-                rpc_list_index,
-                is_syncing: result.is_syncing,
-                reported_head: result.reported_head,
-            };
-
-            // Send the result to the main thread through the channel
-            tx.send(head_result)
-                .await
-                .expect("head check: Channel send error");
+    let rpcs = rpc_list.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let deadline = Duration::from_millis(u64::try_from(ttl).unwrap_or(u64::MAX));
+    let checks = rpcs.into_iter().map(|rpc| async move {
+        let probe = async {
+            let reported_head = rpc.block_number().await.unwrap_or(0);
+            let is_syncing = rpc.syncing().await.unwrap_or(true);
+            (reported_head, is_syncing)
         };
-
-        rpc_futures.push(rpc_future);
-    }
-
-    // Wait for all RPC futures concurrently
-    for rpc_future in rpc_futures {
-        tokio::spawn(rpc_future);
-    }
-
-    // Collect the results in order from the channel
-    for _ in 0..len {
-        if let Some(result) = rx.recv().await {
-            heads.push(result);
+        let (reported_head, is_syncing) = timeout(deadline, probe).await.unwrap_or((0, true));
+        HeadResult {
+            rpc,
+            is_syncing,
+            reported_head,
         }
-    }
-
-    Ok(heads)
+    });
+    Ok(join_all(checks).await)
 }
 
 /// Add unresponsive/erroring RPCs to the poverty list
@@ -206,34 +132,38 @@ fn make_poverty(
     poverty_list: &Arc<RwLock<Vec<Rpc>>>,
     heads: Vec<HeadResult>,
 ) -> Result<u64, HealthError> {
-    // Get the highest head reported by the RPCs
-    let mut highest_head = 0;
-    for head in &heads {
-        if head.reported_head > highest_head {
-            highest_head = head.reported_head;
-        }
-    }
-
-    // Mark all RPCs that dont report the highest head as erroring
     let mut rpc_list_guard = rpc_list.write().unwrap();
     let mut poverty_list_guard = poverty_list.write().unwrap();
+    let highest_head = heads
+        .iter()
+        .filter(|head| {
+            rpc_list_guard
+                .iter()
+                .any(|rpc| rpc.same_endpoint(&head.rpc))
+        })
+        .map(|head| head.reported_head)
+        .max()
+        .unwrap_or(0);
 
     for head in heads {
         if head.reported_head < highest_head || head.is_syncing {
-            // Mark the RPC as erroring
-            rpc_list_guard[head.rpc_list_index].status.is_erroring = true;
-            let rpc_name = &rpc_list_guard[head.rpc_list_index].name;
+            let Some(rpc) = rpc_list_guard
+                .iter_mut()
+                .find(|rpc| rpc.same_endpoint(&head.rpc))
+            else {
+                continue;
+            };
+            rpc.status.is_erroring = true;
+            let rpc_name = &rpc.name;
             tracing::warn!("{rpc_name} is falling behind! Removing from active RPC pool.");
             metrics::gauge!(
                 "rpc_health_by_name",
-                "rpc_name" => rpc_name.to_owned(),
-                "reported_head" => head.reported_head.to_string(),
-                "is_syncing" => head.is_syncing.to_string()
+                "rpc_name" => rpc_name.to_owned()
             )
             .set(0.0);
 
             // Add the RPC to the poverty list
-            poverty_list_guard.push(rpc_list_guard[head.rpc_list_index].clone());
+            poverty_list_guard.push(rpc.clone());
         }
     }
 
@@ -264,28 +194,27 @@ fn escape_poverty(
 
     for head in poverty_heads {
         if head.reported_head >= agreed_head && !head.is_syncing {
-            let mut rpc = poverty_list_guard[head.rpc_list_index].clone();
+            let Some(index) = poverty_list_guard
+                .iter()
+                .position(|rpc| rpc.same_endpoint(&head.rpc))
+            else {
+                continue;
+            };
+            let mut rpc = poverty_list_guard.remove(index);
             rpc.status.is_erroring = false;
             let rpc_name = &rpc.name;
             tracing::info!("{rpc_name} is following the head again! Added to active RPC pool.");
             metrics::gauge!(
                 "rpc_health_by_name",
-                "rpc_name" => rpc_name.to_owned(),
-                "reported_head" => head.reported_head.to_string(),
-                "is_syncing" => head.is_syncing.to_string()
+                "rpc_name" => rpc_name.to_owned()
             )
             .set(1.0);
 
             // Move the RPC from the poverty list to the rpc list
             rpc_list_guard.push(rpc);
-
-            // Remove the RPC from the poverty list
-            poverty_list_guard[head.rpc_list_index].status.is_erroring = false;
         }
     }
 
-    // Only retain erroring RPCs
-    poverty_list_guard.retain(|rpc| rpc.status.is_erroring);
     let healthy = rpc_list_guard.len() as f64;
     let unhealthy = poverty_list_guard.len() as f64;
     let total = healthy + unhealthy;
@@ -316,24 +245,37 @@ pub async fn send_dropped_to_poverty(
     incoming_tx: &mpsc::UnboundedSender<WsconnMessage>,
     rx: broadcast::Receiver<IncomingResponse>,
     sub_data: &Arc<SubscriptionData>,
-    ws_conn_index: usize,
+    dropped: WsChannelErr,
+    ttl: u128,
 ) -> Result<(), HealthError> {
+    let WsChannelErr::Closed(ws_conn_index, dropped_rpc) = dropped;
     {
         let mut rpc_list_guard = rpc_list.write().unwrap();
         let mut poverty_list_guard = poverty_list.write().unwrap();
 
         // Check if the RPC is in the rpc_list
-        if let Some(rpc) = rpc_list_guard.get(ws_conn_index) {
-            // Add the RPC to the poverty list
-            poverty_list_guard.push(rpc.clone());
-
-            // Remove the RPC from the rpc_list
-            rpc_list_guard.remove(ws_conn_index);
+        if let Some(index) = rpc_list_guard
+            .iter()
+            .position(|rpc| rpc.same_endpoint(&dropped_rpc))
+        {
+            let mut rpc = rpc_list_guard.remove(index);
+            rpc.status.is_erroring = true;
+            poverty_list_guard.push(rpc);
         }
     }
 
+    incoming_tx
+        .send(WsconnMessage::Reconnect())
+        .map_err(|_| HealthError::Unresponsive)?;
     // Move subscriptions away from that node
-    move_subscriptions(incoming_tx, rx, sub_data, ws_conn_index).await?;
+    move_subscriptions(
+        incoming_tx,
+        rx,
+        sub_data,
+        ws_conn_index,
+        Duration::from_millis(u64::try_from(ttl).unwrap_or(u64::MAX)),
+    )
+    .await?;
 
     Ok(())
 }
@@ -346,23 +288,24 @@ pub async fn dropped_listener(
     incoming_tx: mpsc::UnboundedSender<WsconnMessage>,
     rx: broadcast::Receiver<IncomingResponse>,
     sub_data: Arc<SubscriptionData>,
+    ttl: u128,
 ) -> Result<(), HealthError> {
     loop {
         let ws_err = ws_err_rx.recv().await;
 
         match ws_err {
-            Some(WsChannelErr::Closed(index)) => {
+            Some(error) => {
                 send_dropped_to_poverty(
                     &rpc_list,
                     &poverty_list,
                     &incoming_tx,
                     rx.resubscribe(),
                     &sub_data,
-                    index,
+                    error,
+                    ttl,
                 )
                 .await
                 .unwrap_or(());
-                incoming_tx.send(WsconnMessage::Reconnect()).unwrap_or(());
             }
             None => {
                 return Err(HealthError::InvalidResponse(
@@ -380,21 +323,30 @@ pub async fn dropped_listener(
 mod tests {
     use super::*;
 
-    // Construct a hypothetical RPC and heads list for testing
+    fn mock_rpc(id: u8) -> Rpc {
+        Rpc::new(
+            format!("https://example.com/{id}").parse().unwrap(),
+            None,
+            1,
+            0,
+            1.0,
+        )
+    }
+
     fn dummy_head_check() -> Vec<HeadResult> {
         vec![
             HeadResult {
-                rpc_list_index: 0,
+                rpc: mock_rpc(1),
                 is_syncing: false,
                 reported_head: 18177557,
             },
             HeadResult {
-                rpc_list_index: 1,
+                rpc: mock_rpc(2),
                 is_syncing: false,
                 reported_head: 18193012,
             },
             HeadResult {
-                rpc_list_index: 2,
+                rpc: mock_rpc(3),
                 is_syncing: false,
                 reported_head: 0,
             },
@@ -404,9 +356,9 @@ mod tests {
     #[test]
     fn test_poverty() {
         // Create a mock RPC list and poverty list
-        let rpc1 = Rpc::default();
-        let rpc2 = Rpc::default();
-        let rpc3 = Rpc::default();
+        let rpc1 = mock_rpc(1);
+        let rpc2 = mock_rpc(2);
+        let rpc3 = mock_rpc(3);
 
         let rpc_list = Arc::new(RwLock::new(vec![rpc1.clone(), rpc2.clone(), rpc3.clone()]));
         let poverty_list = Arc::new(RwLock::new(vec![]));
@@ -432,11 +384,11 @@ mod tests {
     #[test]
     fn test_escape() {
         // Create a mock RPC list and poverty list
-        let mut rpc1 = Rpc::default();
+        let mut rpc1 = mock_rpc(1);
         rpc1.status.is_erroring = true;
 
-        let rpc2 = Rpc::default();
-        let mut rpc3 = Rpc::default();
+        let rpc2 = mock_rpc(2);
+        let mut rpc3 = mock_rpc(3);
         rpc3.status.is_erroring = true;
 
         let rpc_list = Arc::new(RwLock::new(vec![rpc2.clone()]));
@@ -445,17 +397,18 @@ mod tests {
         // Test with dummy head results
         let heads = vec![
             HeadResult {
-                rpc_list_index: 0,
+                rpc: rpc1.clone(),
                 is_syncing: false,
                 reported_head: 18177557,
             },
             HeadResult {
-                rpc_list_index: 1,
+                rpc: rpc3.clone(),
                 is_syncing: false,
                 reported_head: 18193012,
             },
         ];
 
+        poverty_list.write().unwrap().swap(0, 1);
         // Call the escape_poverty function
         let result = escape_poverty(&rpc_list, &poverty_list, heads, 18193012);
         assert!(result.is_ok());
@@ -468,16 +421,18 @@ mod tests {
 
         // The poverty list should have 1 RPC
         assert_eq!(poverty_list_guard.len(), 1);
+        assert!(poverty_list_guard[0].same_endpoint(&rpc1));
+        assert!(rpc_list_guard.iter().any(|rpc| rpc.same_endpoint(&rpc3)));
     }
 
     #[test]
     fn test_escape_sync() {
         // Create a mock RPC list and poverty list
-        let mut rpc1 = Rpc::default();
+        let mut rpc1 = mock_rpc(1);
         rpc1.status.is_erroring = true;
 
-        let rpc2 = Rpc::default();
-        let mut rpc3 = Rpc::default();
+        let rpc2 = mock_rpc(2);
+        let mut rpc3 = mock_rpc(3);
         rpc3.status.is_erroring = true;
 
         let rpc_list = Arc::new(RwLock::new(vec![rpc2.clone()]));
@@ -486,12 +441,12 @@ mod tests {
         // Test with dummy head results
         let heads = vec![
             HeadResult {
-                rpc_list_index: 0,
+                rpc: rpc1.clone(),
                 is_syncing: false,
                 reported_head: 18193012,
             },
             HeadResult {
-                rpc_list_index: 1,
+                rpc: rpc3.clone(),
                 is_syncing: true,
                 reported_head: 18193012,
             },
@@ -509,5 +464,83 @@ mod tests {
 
         // The poverty list should have 1 RPC
         assert_eq!(poverty_list_guard.len(), 1);
+    }
+    async fn stalled_rpc() -> (
+        Rpc,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::{io::AsyncReadExt, net::TcpListener};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut data = [0; 4096];
+            assert!(stream.read(&mut data).await.unwrap() > 0);
+            started_tx.send(()).unwrap();
+            while stream.read(&mut data).await.unwrap() != 0 {}
+        });
+        (Rpc::new(url, None, 1, 0, 1.0), started_rx, server)
+    }
+
+    #[tokio::test]
+    async fn timed_out_health_probe_closes_connection_and_evicts_endpoint() {
+        let (rpc, started, closed) = stalled_rpc().await;
+        let rpc_list = Arc::new(RwLock::new(vec![rpc]));
+        let probing_list = rpc_list.clone();
+        let probe = tokio::spawn(async move { head_check(&probing_list, 100).await.unwrap() });
+        timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap()
+            .unwrap();
+        let replacement = mock_rpc(2);
+        rpc_list.write().unwrap().insert(0, replacement.clone());
+        let heads = probe.await.unwrap();
+        let stale_heads = heads.clone();
+        assert!(heads[0].is_syncing);
+        timeout(Duration::from_secs(2), closed)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let poverty_list = Arc::new(RwLock::new(Vec::new()));
+        make_poverty(&rpc_list, &poverty_list, heads).unwrap();
+        assert_eq!(rpc_list.read().unwrap().len(), 1);
+        assert!(rpc_list.read().unwrap()[0].same_endpoint(&replacement));
+        assert!(poverty_list.read().unwrap()[0].status.is_erroring);
+        make_poverty(&rpc_list, &poverty_list, stale_heads).unwrap();
+        assert_eq!(rpc_list.read().unwrap().len(), 1);
+        assert_eq!(poverty_list.read().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_finality_probe_preserves_last_finalized_block() {
+        let (rpc, started, closed) = stalled_rpc().await;
+        let rpc_list = Arc::new(RwLock::new(vec![rpc]));
+        let (finalized_tx, finalized_rx) = tokio::sync::watch::channel(42);
+        let numbers = Arc::new(RwLock::new(NamedBlocknumbers {
+            finalized: 42,
+            ..NamedBlocknumbers::default()
+        }));
+        let probing_numbers = numbers.clone();
+        let probe = tokio::spawn(async move {
+            get_safe_block(&rpc_list, &finalized_tx, &probing_numbers, 100)
+                .await
+                .unwrap()
+        });
+        timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(probe.await.unwrap(), 42);
+        assert_eq!(*finalized_rx.borrow(), 42);
+        assert_eq!(numbers.read().unwrap().finalized, 42);
+        timeout(Duration::from_secs(2), closed)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

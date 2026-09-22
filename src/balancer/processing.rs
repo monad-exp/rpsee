@@ -12,7 +12,7 @@ use crate::{
 };
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -30,7 +30,7 @@ where
 {
     pub finalized_rx: watch::Receiver<u64>,
     pub named_numbers: Arc<RwLock<NamedBlocknumbers>>,
-    pub head_cache: Arc<RwLock<BTreeMap<u64, Vec<K>>>>,
+    pub head_cache: Arc<RwLock<BTreeMap<u64, BTreeSet<K>>>>,
     pub cache: RequestBus<K, V>,
 }
 
@@ -105,14 +105,14 @@ pub async fn cache_query<K, V>(
     };
     *id = Value::Null;
 
-    if number > *cache_args.finalized_rx.borrow() {
-        cache_args
-            .head_cache
-            .write()
-            .unwrap()
-            .entry(number)
-            .or_default()
-            .push(request_hash.as_bytes().to_owned().into());
+    {
+        let mut head_cache = cache_args.head_cache.write().unwrap();
+        if number > *cache_args.finalized_rx.borrow() {
+            head_cache
+                .entry(number)
+                .or_default()
+                .insert(request_hash.as_bytes().to_owned().into());
+        }
     }
 
     drop(
@@ -225,6 +225,24 @@ mod tests {
             );
         }
         assert!(cache_args.head_cache.read().unwrap().is_empty());
+    }
+
+    #[cfg(not(feature = "no-cache"))]
+    #[tokio::test]
+    async fn repeated_cache_writes_track_each_key_once() {
+        let cache_args = CacheArgs::default();
+        let request = json!({"method": "eth_getBlockByNumber", "params": ["0x10", false]});
+        let hash = hash_request(&request);
+        for _ in 0..3 {
+            cache_query(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x10"}}"#,
+                request.clone(),
+                hash,
+                &cache_args,
+            )
+            .await;
+        }
+        assert_eq!(cache_args.head_cache.read().unwrap()[&16].len(), 1);
     }
 
     #[tokio::test]

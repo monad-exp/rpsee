@@ -5,7 +5,7 @@ use crate::database::{
 };
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, RwLock},
 };
 
@@ -13,7 +13,7 @@ use tokio_stream::{StreamExt, wrappers::WatchStream};
 
 /// Check if we need to do a reorg or if a new block has finalized.
 pub async fn manage_cache<K, V>(
-    head_cache: &Arc<RwLock<BTreeMap<u64, Vec<K>>>>,
+    head_cache: &Arc<RwLock<BTreeMap<u64, BTreeSet<K>>>>,
     blocknum_rx: tokio::sync::watch::Receiver<u64>,
     finalized_rx: Arc<tokio::sync::watch::Receiver<u64>>,
     cache: RequestBus<K, V>,
@@ -23,31 +23,23 @@ where
     V: GenericBytes,
 {
     let mut block_number = 0;
-    let mut last_finalized = 0;
+    let mut blocknum_stream = WatchStream::new(blocknum_rx);
+    let mut finalized_stream = WatchStream::new(finalized_rx.as_ref().clone());
 
-    let mut blocknum_stream = WatchStream::new(blocknum_rx.clone());
-
-    // Loop for waiting on new values from the finalized_rx channel
-    while blocknum_stream.next().await.is_some() {
-        let new_block = *blocknum_rx.borrow();
-
-        // If a new block is less or equal to the last block in our cache,
-        // that means that the chain has experienced a reorg and that we should
-        // remove everything from the last block to the `new_block`
-        if new_block <= block_number {
-            tracing::warn!("Reorg detected! Removing stale entries from the cache.");
-            handle_reorg(head_cache, block_number, new_block, cache.clone()).await?;
+    loop {
+        tokio::select! {
+            Some(new_block) = blocknum_stream.next() => {
+                if new_block <= block_number {
+                    tracing::warn!("Reorg detected! Removing stale entries from the cache.");
+                    handle_reorg(head_cache, block_number, new_block, cache.clone()).await?;
+                }
+                block_number = new_block;
+            }
+            Some(finalized) = finalized_stream.next() => {
+                remove_stale(head_cache, finalized)?;
+            }
+            else => break,
         }
-
-        // Check if finalized_stream has changed
-        if last_finalized != *finalized_rx.borrow() {
-            last_finalized = *finalized_rx.borrow();
-            tracing::info!("New finalized block! Removing stale entries from the cache.");
-            // Remove stale entries from the head_cache
-            remove_stale(head_cache, last_finalized)?;
-        }
-
-        block_number = new_block;
     }
     Ok(())
 }
@@ -56,7 +48,7 @@ where
 /// If a reorg happens, we need to remove all queries in the reorg range
 /// from the sled database.
 async fn handle_reorg<K, V>(
-    head_cache: &Arc<RwLock<BTreeMap<u64, Vec<K>>>>,
+    head_cache: &Arc<RwLock<BTreeMap<u64, BTreeSet<K>>>>,
     block_number: u64,
     new_block: u64,
     cache: RequestBus<K, V>,
@@ -90,7 +82,7 @@ where
 /// Once a new block finalizes, we can be sure that certain TXs wont
 /// reorg, so theyre safe to be permanantly in the cache.
 fn remove_stale<K: GenericBytes>(
-    head_cache: &Arc<RwLock<BTreeMap<u64, Vec<K>>>>,
+    head_cache: &Arc<RwLock<BTreeMap<u64, BTreeSet<K>>>>,
     block_number: u64,
 ) -> Result<(), DbError> {
     head_cache
@@ -111,6 +103,39 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[tokio::test]
+    async fn finalization_prunes_tracking_without_head_notifications() {
+        let head_cache = Arc::new(RwLock::new(BTreeMap::from([
+            (4, BTreeSet::from([b"finalized".to_vec()])),
+            (5, BTreeSet::from([b"pending".to_vec()])),
+        ])));
+        let (head_tx, head_rx) = tokio::sync::watch::channel(0);
+        let (finalized_tx, finalized_rx) = tokio::sync::watch::channel(0);
+        let (db_tx, mut db_rx) = mpsc::unbounded_channel::<DbRequest<Vec<u8>, Vec<u8>>>();
+        let task_cache = head_cache.clone();
+        let task = tokio::spawn(async move {
+            manage_cache(&task_cache, head_rx, Arc::new(finalized_rx), db_tx)
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), db_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(head_tx);
+        finalized_tx.send(4).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while head_cache.read().unwrap().contains_key(&4) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finalized tracking retained without a new head");
+        assert!(head_cache.read().unwrap().contains_key(&5));
+        drop(finalized_tx);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
     #[serial_test::serial]
     async fn test_handle_reorg() {
         // Create test data and resources
@@ -125,9 +150,9 @@ mod tests {
         // Add some data to the head_cache
         {
             let mut head_cache_guard = head_cache.write().unwrap();
-            head_cache_guard.insert(1, vec!["key1".as_bytes()]);
-            head_cache_guard.insert(2, vec!["key2".as_bytes()]);
-            head_cache_guard.insert(3, vec!["key3".as_bytes()]);
+            head_cache_guard.insert(1, BTreeSet::from(["key1".as_bytes()]));
+            head_cache_guard.insert(2, BTreeSet::from(["key2".as_bytes()]));
+            head_cache_guard.insert(3, BTreeSet::from(["key3".as_bytes()]));
         }
 
         let (db_tx, db_rx) = mpsc::unbounded_channel::<DbRequest<&[u8], &[u8]>>();
@@ -177,8 +202,8 @@ mod tests {
         // Add some data to the head_cache
         {
             let mut head_cache_guard = head_cache.write().unwrap();
-            head_cache_guard.insert(1, vec!["key1".as_bytes()]);
-            head_cache_guard.insert(2, vec!["key2".as_bytes()]);
+            head_cache_guard.insert(1, BTreeSet::from(["key1".as_bytes()]));
+            head_cache_guard.insert(2, BTreeSet::from(["key2".as_bytes()]));
         }
 
         // Call remove_stale

@@ -14,6 +14,7 @@ use crate::{
     },
 };
 
+use futures_util::future::join_all;
 use std::sync::{Arc, RwLock};
 
 use tokio::{
@@ -50,69 +51,17 @@ pub async fn get_safe_block(
     named_numbers_rwlock: &Arc<RwLock<NamedBlocknumbers>>,
     ttl: u64,
 ) -> Result<u64, RpcError> {
-    let len;
-    let rpc_list_clone;
-    {
-        let rpc_list_guard = rpc_list.read().unwrap_or_else(|e| {
-            // Handle the case where the RwLock is poisoned
-            e.into_inner()
-        });
-
-        len = rpc_list_guard.len();
-        rpc_list_clone = rpc_list_guard.clone();
-    }
-
-    let mut safe = 0;
-
-    // If len == 0 return 0
-    if len == 0 {
-        return Ok(safe);
-    }
-
-    // Create a vector to store the futures of all RPC requests
-    let mut rpc_futures = Vec::new();
-
-    // Create a channel for collecting results
-    let (tx, mut rx) = mpsc::channel(len);
-
-    // Iterate over all RPCs
-    for rpc in rpc_list_clone.into_iter().take(len) {
-        let tx = tx.clone(); // Clone the sender for this RPC
-
-        // Spawn a future for each RPC
-        let rpc_future = async move {
-            let a = rpc.get_finalized_block();
-            let result = timeout(Duration::from_millis(ttl), a).await;
-
-            // Handle timeout as 0
-            let reported_finalized = match result {
-                Ok(Ok(response)) => response,
-                Err(_) => 0,
-                Ok(Err(_)) => 0,
-            };
-
-            // Send the result to the main thread through the channel
-            tx.send(reported_finalized)
-                .await
-                .expect("head check: Channel send error");
-        };
-
-        rpc_futures.push(rpc_future);
-    }
-
-    // Wait for all RPC futures concurrently
-    for rpc_future in rpc_futures {
-        tokio::spawn(rpc_future);
-    }
-
-    // Collect the results in order from the channel
-    for _ in 0..len {
-        if let Some(result) = rx.recv().await
-            && result > safe
-        {
-            safe = result;
-        }
-    }
+    let rpcs = rpc_list.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let checks = rpcs.into_iter().map(|rpc| async move {
+        timeout(Duration::from_millis(ttl), rpc.get_finalized_block())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    });
+    let safe = join_all(checks).await.into_iter().flatten().max();
+    let Some(safe) = safe else {
+        return Ok(named_numbers_rwlock.read().unwrap().finalized);
+    };
 
     // Send new blocknumber if modified
     let send_if_changed = |number: &mut u64| {
@@ -141,7 +90,9 @@ async fn send_newheads_sub_message<K, V>(
     outgoing_rx: &broadcast::Receiver<IncomingResponse>,
     sub_data: &Arc<SubscriptionData>,
     cache_args: &CacheArgs<K, V>,
-) where
+    ttl: Duration,
+) -> bool
+where
     K: GenericBytes + From<[u8; 32]>,
     V: GenericBytes + From<Vec<u8>>,
 {
@@ -152,26 +103,21 @@ async fn send_newheads_sub_message<K, V>(
         "id": user_id.to_string(),
     });
 
-    match execute_ws_call(
-        call.clone(),
-        user_id,
-        incoming_tx,
-        outgoing_rx.resubscribe(),
-        sub_data,
-        cache_args,
-    )
-    .await
-    {
-        Ok(_) => {
-            let _ = sub_data.subscribe_user(user_id, call);
-        }
-        Err(e) => {
-            panic!(
-                "FATAL: Error subscribing to newHeads in health check: {}",
-                e
+    matches!(
+        timeout(
+            ttl,
+            execute_ws_call(
+                call.clone(),
+                user_id,
+                incoming_tx,
+                outgoing_rx.resubscribe(),
+                sub_data,
+                cache_args,
             )
-        }
-    };
+        )
+        .await,
+        Ok(Ok(_))
+    ) && sub_data.subscribe_user(user_id, call).is_ok()
 }
 
 /// Subscribe to eth_subscribe("newHeads") and write to NamedBlocknumbers
@@ -201,22 +147,38 @@ pub async fn subscribe_to_new_heads<K, V>(
     let user_data = tx.clone();
     sub_data.add_user(user_id, user_data);
 
-    send_newheads_sub_message(user_id, &incoming_tx, &outgoing_rx, &sub_data, &cache_args).await;
+    let ttl = Duration::from_millis(expected_block_time);
+    while !send_newheads_sub_message(
+        user_id,
+        &incoming_tx,
+        &outgoing_rx,
+        &sub_data,
+        &cache_args,
+        ttl,
+    )
+    .await
+    {
+        if incoming_tx.send(WsconnMessage::Reconnect()).is_err() {
+            return;
+        }
+        tracing::warn!("Unable to subscribe to newHeads; retrying");
+        tokio::time::sleep(ttl).await;
+    }
 
     // New message == new head received. We can then update and process
     // everything associated with a new head block.
-    let mut subscription_id: String = "".to_string();
     loop {
         match timeout(Duration::from_millis(expected_block_time), rx.recv()).await {
             Ok(Some(msg)) => {
                 if let RequestResult::Subscription(sub) = msg {
-                    let mut nn_rwlock = cache_args.named_numbers.write().unwrap();
-                    let a = hex_to_decimal(sub["params"]["result"]["number"].as_str().unwrap())
-                        .unwrap();
-                    sub["params"]["subscription"]
+                    let Some(a) = sub["params"]["result"]["number"]
                         .as_str()
-                        .unwrap()
-                        .clone_into(&mut subscription_id);
+                        .and_then(|number| hex_to_decimal(number).ok())
+                    else {
+                        tracing::warn!("Invalid block number in newHeads notification");
+                        continue;
+                    };
+                    let mut nn_rwlock = cache_args.named_numbers.write().unwrap();
                     tracing::info!(a, "New chain head");
                     let _ = blocknum_tx.send(a);
                     nn_rwlock.latest = a;
@@ -225,7 +187,7 @@ pub async fn subscribe_to_new_heads<K, V>(
             Ok(None) => {
                 // Handle the case where the channel is closed
                 tracing::error!("newHeads channel closed.");
-                panic!("FATAL: Channel closed in newHeads subscription.");
+                return;
             }
             Err(_) => {
                 // Handle the timeout case
@@ -240,9 +202,7 @@ pub async fn subscribe_to_new_heads<K, V>(
                         Ok(_) => {}
                         Err(_) => {
                             tracing::error!("WS incoming channel closed.");
-                            panic!(
-                                "FATAL: WS module failed trying to reinitialize! Please restart Rpsee!"
-                            );
+                            return;
                         }
                     }
                     drop(nn_rwlock);
@@ -250,7 +210,10 @@ pub async fn subscribe_to_new_heads<K, V>(
                 tracing::warn!(
                     "Timeout in newHeads subscription, possible connection failiure or missed block."
                 );
-                let node_id = match sub_data.get_node_from_id(&subscription_id) {
+                let node_id = match sub_data
+                    .get_sub_id_by_params(r#"["newHeads"]"#)
+                    .and_then(|id| sub_data.get_node_from_id(&id))
+                {
                     Some(node_id) => node_id,
                     None => {
                         tracing::error!(
@@ -264,6 +227,7 @@ pub async fn subscribe_to_new_heads<K, V>(
                     outgoing_rx.resubscribe(),
                     &sub_data,
                     node_id,
+                    Duration::from_millis(expected_block_time),
                 )
                 .await
                 {
@@ -276,70 +240,3 @@ pub async fn subscribe_to_new_heads<K, V>(
         }
     }
 }
-
-// TODO: this :(
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use tokio::sync::mpsc;
-//     use std::sync::{Arc, RwLock};
-
-//     fn mock_rpc() -> Rpc {
-//         Rpc::new("http://localhost:3030".to_string(), Some("ws://localhost:3030".to_string()), 1000, 1, 10.0)
-//     }
-
-//     // #[tokio::test]
-//     // async fn test_get_safe_block_empty_rpc_list() {
-//     //     let rpc_list = Arc::new(RwLock::new(Vec::new()));
-//     //     let (finalized_tx, _) = tokio::sync::watch::channel(0);
-//     //     let named_numbers_rwlock = Arc::new(RwLock::new(NamedBlocknumbers::default()));
-//     //     let ttl = 1000;
-
-//     //     let result = get_safe_block(&rpc_list, &finalized_tx, &named_numbers_rwlock, ttl).await;
-//     //     assert!(result.is_ok());
-//     //     assert_eq!(result.unwrap(), 0);
-//     // }
-
-//     // #[tokio::test]
-//     // async fn test_get_safe_block_with_rpc() {
-//     //     let rpc_list = Arc::new(RwLock::new(vec![mock_rpc()]));
-//     //     let (finalized_tx, _) = tokio::sync::watch::channel(0);
-//     //     let named_numbers_rwlock = Arc::new(RwLock::new(NamedBlocknumbers::default()));
-//     //     let ttl = 1000;
-
-//     //     let result = get_safe_block(&rpc_list, &finalized_tx, &named_numbers_rwlock, ttl).await;
-//     //     assert!(result.is_ok());
-//     //     assert_eq!(result.unwrap(), 0); // Assuming mocked RPC returns 0 for finalized block
-//     // }
-
-//     #[tokio::test]
-//     async fn test_subscribe_to_new_heads() {
-//         let (incoming_tx, _) = mpsc::unbounded_channel();
-//         let (outgoing_tx, outgoing_rx) = broadcast::channel(10);
-//         let sub_data = Arc::new(SubscriptionData::new());
-//         let cache_args = CacheArgs::default();
-//         let ttl = 1000;
-
-//         // Mock sending newHead subscription message
-//         outgoing_tx.send(IncomingResponse {
-//             content: serde_json::json!({
-//                 "params": {
-//                     "result": {
-//                         "number": "0x1"
-//                     }
-//                 }
-//             }),
-//             node_id: 1,
-//         }).unwrap();
-
-//         tokio::spawn(async move {
-//             subscribe_to_new_heads(incoming_tx, outgoing_rx, sub_data, cache_args, ttl).await;
-//         });
-
-//         // Allow for some processing time
-//         tokio::time::sleep(Duration::from_millis(500)).await;
-
-//         // Expectations and assertions would typically follow here,
-//         // but they are limited due to the nature of `subscribe_to_new_heads` function's loop.
-//     }
-// }

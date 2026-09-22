@@ -44,7 +44,7 @@ impl From<WsconnMessage> for Value {
 /// WsChannelErr enum
 #[derive(Debug, Clone)]
 pub enum WsChannelErr {
-    Closed(usize),
+    Closed(usize, crate::Rpc),
 }
 
 pub type UserData = mpsc::UnboundedSender<RequestResult>;
@@ -61,12 +61,19 @@ pub struct IncomingResponse {
     pub node_id: usize,
 }
 
+#[derive(Debug, Clone)]
+struct Subscription {
+    // The client keeps this ID when the upstream subscription moves.
+    client_id: String,
+    users: HashSet<u32>,
+}
+
 /// Main struct for storing data related to subscriptions and the associated users
 /// TODO: we should probably store more data for the sake of compute performance
 #[derive(Debug, Clone)]
 pub struct SubscriptionData {
     users: Arc<RwLock<HashMap<u32, UserData>>>,
-    subscriptions: Arc<RwLock<HashMap<NodeSubInfo, HashSet<u32>>>>,
+    subscriptions: Arc<RwLock<HashMap<NodeSubInfo, Subscription>>>,
     incoming_subscriptions: Arc<RwLock<HashMap<String, NodeSubInfo>>>,
 }
 
@@ -95,11 +102,6 @@ impl SubscriptionData {
 
         if users.remove(&user_id).is_some() {
             metrics::gauge!("ws_users_total").decrement(1);
-            let mut subscriptions = self.subscriptions.write().unwrap();
-            for user_subscriptions in subscriptions.values_mut() {
-                user_subscriptions.remove(&user_id);
-                metrics::gauge!("ws_user_subs_total").decrement(1);
-            }
         }
     }
 
@@ -120,7 +122,8 @@ impl SubscriptionData {
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
             if incoming_subscriptions.contains_key(&subscription) {
-                metrics::counter!("ws_duplicate_node_subs", "subscription_id" => subscription_id.clone(), "node_id" => node_id.to_string()).increment(1);
+                metrics::counter!("ws_duplicate_node_subs", "node_id" => node_id.to_string())
+                    .increment(1);
             }
         }
 
@@ -145,20 +148,6 @@ impl SubscriptionData {
             .is_none()
         {
             metrics::gauge!("ws_node_subs_total").increment(1);
-        }
-    }
-
-    pub fn unregister_subscription(&self, subscription_request: String) {
-        let mut incoming_subscriptions = self
-            .incoming_subscriptions
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-
-        if incoming_subscriptions
-            .remove(&subscription_request)
-            .is_some()
-        {
-            metrics::gauge!("ws_node_subs_total").decrement(1);
         }
     }
 
@@ -191,15 +180,16 @@ impl SubscriptionData {
         };
 
         let mut subscriptions = self.subscriptions.write().unwrap();
-        if subscriptions
+        let subscription = subscriptions
             .entry(node_sub_info.clone())
-            .or_default()
-            .insert(user_id)
-        {
+            .or_insert_with(|| Subscription {
+                client_id: node_sub_info.subscription_id.clone(),
+                users: HashSet::new(),
+            });
+        if subscription.users.insert(user_id) {
             metrics::gauge!("ws_user_subs_total").increment(1);
         }
-
-        Ok(node_sub_info.subscription_id.clone())
+        Ok(subscription.client_id.clone())
     }
 
     // Unsubscribe a user from a subscription
@@ -209,10 +199,11 @@ impl SubscriptionData {
             .write()
             .unwrap_or_else(|e| e.into_inner());
 
-        // Directly unsubscribing the user within the loop
-        for (node_sub_info, subscribers) in subscriptions.iter_mut() {
-            if node_sub_info.subscription_id == subscription_id && subscribers.contains(&user_id) {
-                subscribers.remove(&user_id);
+        for (node, subscription) in subscriptions.iter_mut() {
+            if (subscription.client_id == subscription_id
+                || node.subscription_id == subscription_id)
+                && subscription.users.remove(&user_id)
+            {
                 metrics::gauge!("ws_user_subs_total").decrement(1);
             }
         }
@@ -227,8 +218,7 @@ impl SubscriptionData {
 
         // Directly unsubscribing the user within the loop
         for subscribers in subscriptions.values_mut() {
-            if subscribers.contains(&user_id) {
-                subscribers.remove(&user_id);
+            if subscribers.users.remove(&user_id) {
                 metrics::gauge!("ws_user_subs_total").decrement(1);
             }
         }
@@ -236,6 +226,17 @@ impl SubscriptionData {
 
     // Return the node_id for a given subscription_id
     pub fn get_node_from_id(&self, subscription_id: &str) -> Option<usize> {
+        if let Some(node_id) =
+            self.subscriptions
+                .read()
+                .unwrap()
+                .iter()
+                .find_map(|(node, subscription)| {
+                    (subscription.client_id == subscription_id).then_some(node.node_id)
+                })
+        {
+            return Some(node_id);
+        }
         let incoming_subscriptions = self
             .incoming_subscriptions
             .read()
@@ -282,13 +283,7 @@ impl SubscriptionData {
             .iter()
             .filter_map(|(subscription, node_sub_info)| {
                 if node_sub_info.node_id == node_id {
-                    // Parse the subscription string as a JSON array
-                    serde_json::from_str::<Vec<String>>(subscription)
-                        .ok()
-                        .and_then(|v| {
-                            // Serialize each Vec<String> back into a JSON string format
-                            serde_json::to_string(&v).ok()
-                        })
+                    Some(subscription.clone())
                 } else {
                     None
                 }
@@ -314,6 +309,7 @@ impl SubscriptionData {
     }
 
     // Return a Vec of all users subscribed to a subscription
+    #[cfg(test)]
     pub fn get_users_for_subscription(&self, subscription_id: &str) -> Vec<u32> {
         let subscriptions = self.subscriptions.read().unwrap_or_else(|e| e.into_inner());
 
@@ -321,7 +317,7 @@ impl SubscriptionData {
 
         for (node_sub_info, subscribers) in subscriptions.iter() {
             if node_sub_info.subscription_id == subscription_id {
-                users.extend(subscribers.iter().copied());
+                users.extend(subscribers.users.iter().copied());
                 break;
             }
         }
@@ -336,24 +332,20 @@ impl SubscriptionData {
         request: String,
         subscription_id: String,
     ) -> Result<(), WsError> {
-        // Get all the users that are subscribed to our subscription
-        let users = self.get_users_for_subscription(&subscription_id);
-        if users.is_empty() {
-            return Err(WsError::EmptyList("User list empty!".to_string()));
-        }
-        // Unsubscribe everyone from the subscription
-        for user_id in users.iter() {
-            self.unsubscribe_user(*user_id, request.clone());
-        }
-
-        // Unregister/register
-        self.unregister_subscription(request.clone());
-        self.raw_register(&request, subscription_id, target);
-
-        // resubscribe all the users now
-        for user_id in users.iter() {
-            self.raw_subscribe(*user_id, &request)?;
-        }
+        let mut incoming = self.incoming_subscriptions.write().unwrap();
+        let previous = incoming
+            .get_mut(&request)
+            .ok_or(WsError::MissingSubscription())?;
+        let mut subscriptions = self.subscriptions.write().unwrap();
+        let subscription = subscriptions
+            .remove(previous)
+            .filter(|subscription| !subscription.users.is_empty())
+            .ok_or_else(|| WsError::EmptyList("User list empty!".to_string()))?;
+        *previous = NodeSubInfo {
+            node_id: target,
+            subscription_id,
+        };
+        subscriptions.insert(previous.clone(), subscription);
 
         Ok(())
     }
@@ -375,29 +367,41 @@ impl SubscriptionData {
             subscription_id: subscription_id.to_string(),
         };
 
-        let users = self.users.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(subscribers) = self.subscriptions.read().unwrap().get(&node_sub_info) {
-            if subscribers.is_empty() {
-                self.unregister_subscription(subscription_id.to_string());
-                tracing::info!(
-                    subscription_id,
-                    "No more users to send subscription to: Unsubscribing from ID",
-                );
+        let subscription = self
+            .subscriptions
+            .read()
+            .unwrap()
+            .get(&node_sub_info)
+            .cloned();
+        if let Some(subscription) = subscription {
+            if subscription.users.is_empty() {
+                let mut incoming = self.incoming_subscriptions.write().unwrap();
+                let mut subscriptions = self.subscriptions.write().unwrap();
+                if !subscriptions
+                    .get(&node_sub_info)
+                    .is_some_and(|subscription| subscription.users.is_empty())
+                {
+                    return Ok(false);
+                }
+                let previous_count = incoming.len();
+                incoming.retain(|_, node| node != &node_sub_info);
+                metrics::gauge!("ws_node_subs_total")
+                    .decrement((previous_count - incoming.len()) as f64);
+                subscriptions.remove(&node_sub_info);
                 return Ok(true);
             }
-            for &user_id in subscribers {
-                if let Some(user) = users.get(&user_id) {
-                    tracing::debug!("Sending user_id {:?} subscription: {:?}", user_id, message);
-                    match user.send(message.clone()) {
-                        Ok(_) => {}
-                        Err(_) => {
-                            tracing::warn!(
-                                "user_id {} unsubscribed without closing channel! Removing.",
-                                user_id
-                            );
-                            let _ = &self.unsubscribe_user(user_id, subscription_id.to_string());
-                        }
-                    };
+            let mut message = message.clone();
+            if let RequestResult::Subscription(message) = &mut message
+                && let Some(id) = message
+                    .get_mut("params")
+                    .and_then(|params| params.get_mut("subscription"))
+            {
+                *id = subscription.client_id.clone().into();
+            }
+            for user_id in subscription.users {
+                let user = self.users.read().unwrap().get(&user_id).cloned();
+                if user.is_some_and(|user| user.send(message.clone()).is_err()) {
+                    self.unsubscribe_user(user_id, subscription.client_id.clone());
                 }
             }
         }
@@ -502,7 +506,7 @@ mod tests {
                 .any(|(k, v)| {
                     k.node_id == node_id
                         && k.subscription_id == subscription_id
-                        && v.contains(&user_id)
+                        && v.users.contains(&user_id)
                 })
         );
 
@@ -516,7 +520,7 @@ mod tests {
                 .any(|(k, v)| {
                     k.node_id == node_id
                         && k.subscription_id == subscription_id
-                        && v.contains(&user_id)
+                        && v.users.contains(&user_id)
                 })
         );
     }
@@ -545,7 +549,7 @@ mod tests {
                 .any(|(k, v)| {
                     k.node_id == node_id
                         && k.subscription_id == subscription_id
-                        && v.contains(&user_id)
+                        && v.users.contains(&user_id)
                 })
         );
 
@@ -559,7 +563,7 @@ mod tests {
                 .any(|(k, v)| {
                     k.node_id == node_id
                         && k.subscription_id == subscription_id
-                        && v.contains(&user_id)
+                        && v.users.contains(&user_id)
                 })
         );
     }
@@ -810,6 +814,7 @@ mod tests {
             subscriptions
                 .get(&node_sub_info)
                 .unwrap()
+                .users
                 .contains(&user_id)
         );
 
@@ -853,7 +858,7 @@ mod tests {
         let subscriptions = subscription_data.subscriptions.read().unwrap();
         assert!(
             subscriptions.get(node_sub_info).is_none()
-                || subscriptions.get(node_sub_info).unwrap().is_empty()
+                || subscriptions.get(node_sub_info).unwrap().users.is_empty()
         );
     }
 

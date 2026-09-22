@@ -121,8 +121,13 @@ impl Settings {
     pub(crate) async fn sort_on_startup(self) -> Result<Self, ConfigError> {
         tracing::info!("Sorting RPCs by latency...");
         let len = self.rpc_list.len();
-        let (rpc_list, poverty_list) =
-            sort_by_latency(self.rpc_list, Vec::with_capacity(len), self.ma_length).await?;
+        let (rpc_list, poverty_list) = sort_by_latency(
+            self.rpc_list,
+            Vec::with_capacity(len),
+            self.ma_length,
+            self.ttl,
+        )
+        .await?;
 
         Ok(Self {
             rpc_list,

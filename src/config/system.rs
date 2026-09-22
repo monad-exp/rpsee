@@ -1,7 +1,6 @@
 // System consts
 pub const WS_HEALTH_CHECK_USER_ID: u32 = 1;
 pub const WS_SUB_MANAGER_ID: u32 = 2;
-pub const MAGIC: u32 = 0xb153;
 /// DB fanout,
 /// The default value of 1024 causes keys and values to be
 /// more efficiently compressed when stored on disk,

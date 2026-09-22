@@ -220,14 +220,13 @@ async fn run<DB: GenericDatabase + 'static>(
 
         let rpc_list_ws = Arc::clone(&rpc_list_rwlock);
         // TODO: make this more ergonomic
-        let ws_handle = Arc::new(RwLock::new(Vec::<
-            Option<mpsc::UnboundedSender<serde_json::Value>>,
-        >::new()));
+        let ws_handle = Arc::new(RwLock::new(Vec::new()));
         let outgoing_rx_ws = outgoing_rx.resubscribe();
         let incoming_tx_ws = incoming_tx.clone();
         let ws_error_tx_ws = ws_error_tx.clone();
 
         let sub_dispatcher = Arc::clone(&sub_data);
+        let ws_ttl = config.read().unwrap().ttl;
 
         tokio::task::spawn(async move {
             tokio::task::spawn(async move {
@@ -241,6 +240,7 @@ async fn run<DB: GenericDatabase + 'static>(
                 incoming_rx,
                 outgoing_tx,
                 ws_error_tx_ws,
+                ws_ttl,
             )
             .await;
         });
@@ -260,6 +260,7 @@ async fn run<DB: GenericDatabase + 'static>(
                     dropped_inc,
                     dropped_rx,
                     dropped_sub_data,
+                    ws_ttl,
                 )
                 .await
             });
