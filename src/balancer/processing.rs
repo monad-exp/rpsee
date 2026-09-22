@@ -19,7 +19,6 @@ use std::{
 
 use tokio::sync::watch;
 
-use blake3::Hash;
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -67,17 +66,18 @@ pub fn can_cache<M: AsRef<str>>(method: M, result: &str) -> bool {
     cache_method(method) && cache_result(result)
 }
 
-pub fn hash_request(request: &Value) -> Hash {
+pub fn hash_request(request: &Value) -> [u8; 32] {
     let request = request.to_string();
-    #[cfg(not(feature = "xxhash"))]
+    #[cfg(feature = "blake3")]
     {
-        blake3::hash(request.as_bytes())
+        *blake3::hash(request.as_bytes()).as_bytes()
     }
-    #[cfg(feature = "xxhash")]
+    #[cfg(not(feature = "blake3"))]
     {
+        // Preserve the existing 32-byte xxHash cache key format.
         let mut bytes = [0; 32];
         bytes[..16].copy_from_slice(&xxhash_rust::xxh3::xxh3_128(request.as_bytes()).to_le_bytes());
-        Hash::from(bytes)
+        bytes
     }
 }
 
@@ -85,7 +85,7 @@ pub fn hash_request(request: &Value) -> Hash {
 pub async fn cache_query<K, V>(
     response: &str,
     request: Value,
-    request_hash: Hash,
+    request_hash: [u8; 32],
     cache_args: &CacheArgs<K, V>,
 ) where
     K: GenericBytes + From<[u8; 32]>,
@@ -111,14 +111,14 @@ pub async fn cache_query<K, V>(
             head_cache
                 .entry(number)
                 .or_default()
-                .insert(request_hash.as_bytes().to_owned().into());
+                .insert(request_hash.into());
         }
     }
 
     drop(
         db_insert(
             &cache_args.cache,
-            request_hash.as_bytes().to_owned().into(),
+            request_hash.into(),
             response.to_string().into_bytes().into(),
         )
         .await,
@@ -153,6 +153,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cache_hash_preserves_selected_algorithm_key_format() {
+        let request = json!({"id": null, "jsonrpc": "2.0", "method": "eth_chainId", "params": []});
+        #[cfg(not(feature = "blake3"))]
+        let expected = [
+            139, 219, 253, 61, 75, 68, 3, 89, 8, 209, 150, 99, 146, 159, 12, 204, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        #[cfg(feature = "blake3")]
+        let expected = [
+            207, 99, 121, 31, 180, 164, 209, 193, 251, 150, 17, 239, 173, 252, 198, 133, 140, 122,
+            72, 61, 142, 14, 242, 184, 59, 117, 224, 48, 72, 49, 90, 79,
+        ];
+        assert_eq!(hash_request(&request), expected);
+    }
+
+    #[test]
     fn test_can_cache() {
         assert_eq!(
             can_cache(EthRpcMethod::GetBlockByNumber, r#"{"result": "0x1"}"#),
@@ -176,13 +192,11 @@ mod tests {
         let cache_args = CacheArgs::default();
         let rx = r#"{"jsonrpc":"2.0","result":"line\n\"quoted\"","id":1}"#.to_string();
         let method = json!({"method": EthRpcMethod::GetBlockByNumber, "params": ["0x10", false]});
-        let tx_hash = blake3::hash(method.to_string().as_bytes());
+        let tx_hash = hash_request(&method);
 
         cache_query(&rx, method.clone(), tx_hash, &cache_args).await;
 
-        let cached_value = db_get!(cache_args.cache, tx_hash.as_bytes().to_owned())
-            .unwrap()
-            .unwrap();
+        let cached_value = db_get!(cache_args.cache, tx_hash).unwrap().unwrap();
         let cached_str = std::str::from_utf8(&cached_value).unwrap();
         assert_eq!(
             cached_str,
@@ -200,11 +214,11 @@ mod tests {
         let cache_args = CacheArgs::default();
         let rx = r#"{ "code": -32005, "data": { "see": "https://infura.io/dashboard" }, "message": "daily request count exceeded, request rate limited" }, payload={ "id": 12449, "jsonrpc": "2.0", "method": "eth_blockNumber", "params": [  ] }"#.to_string();
         let method = json!({"method": EthRpcMethod::GetBlockByNumber, "params": ["0x10", false]});
-        let tx_hash = blake3::hash(method.to_string().as_bytes());
+        let tx_hash = hash_request(&method);
 
         cache_query(&rx, method.clone(), tx_hash, &cache_args).await;
 
-        let cached_value = db_get!(cache_args.cache, tx_hash.as_bytes().to_owned()).unwrap();
+        let cached_value = db_get!(cache_args.cache, tx_hash).unwrap();
         assert!(
             cached_value.is_none(),
             "got cached value for transaction that should have failed"
@@ -218,11 +232,7 @@ mod tests {
         let hash = hash_request(&request);
         for response in ["not JSON", r#"{"result":"0x1"}"#] {
             cache_query(response, request.clone(), hash, &cache_args).await;
-            assert!(
-                db_get!(cache_args.cache, *hash.as_bytes())
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(db_get!(cache_args.cache, hash).unwrap().is_none());
         }
         assert!(cache_args.head_cache.read().unwrap().is_empty());
     }

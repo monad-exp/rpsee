@@ -160,7 +160,7 @@ where
     let hash = hash_request(&request);
 
     if !notification {
-        match db_get!(cache.cache, hash.as_bytes().to_owned().into()) {
+        match db_get!(cache.cache, hash.into()) {
             Ok(Some(mut bytes)) => {
                 if let Ok(Value::Object(mut cached)) =
                     simd_json::serde::from_slice::<Value>(&mut bytes)

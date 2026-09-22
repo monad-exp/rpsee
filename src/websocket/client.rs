@@ -370,7 +370,7 @@ where
     }
     let tx_hash = hash_request(&call);
 
-    if let Ok(Some(mut bytes)) = db_get!(cache_args.cache, tx_hash.as_bytes().to_owned().into())
+    if let Ok(Some(mut bytes)) = db_get!(cache_args.cache, tx_hash.into())
         && let Ok(Value::Object(mut cached)) = from_slice::<Value>(&mut bytes)
     {
         cached.insert("id".into(), id);

@@ -32,8 +32,8 @@ jobs:
             features: --all-features
           - name: sled
             features: --no-default-features --features sled,selection-weighed-round-robin
-          - name: xxhash
-            features: --no-default-features --features sled,xxhash
+          - name: blake3
+            features: --no-default-features --features sled,blake3
           - name: rocksdb
             features: --no-default-features --features rocksdb,selection-weighed-round-robin
     name: Test (${{ matrix.name }})

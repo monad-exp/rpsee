@@ -45,6 +45,8 @@ cargo build --release --locked --no-default-features --features rocksdb,selectio
 
 Set `db` in the configuration to a backend enabled in your build.
 
+Cache keys use XXH3-128 by default, including builds with `--no-default-features`. To use BLAKE3, build with `cargo build --release --locked --features blake3`. Switching algorithms creates new cache keys and leaves old entries on disk; use `--clear-cache` or set `clear_cache = true` under `[rpsee]` to clear the cache when needed.
+
 Sled's `cache_capacity_bytes` controls its in-memory cache budget. It does not cap total process memory or database disk usage. Cached historical responses persist on disk; rpsee does not impose a disk quota. Size the cache volume separately from the memory limit. The `ttl` setting is the timeout for each upstream request attempt in milliseconds, not a cache lifetime; `health_check_ttl` is the health-check polling interval.
 
 ### Metrics and logging

@@ -26,33 +26,20 @@ pub fn setup_data<DB: GenericDatabase>(cache: &DB, do_clear: bool) {
             "params": [],
         });
         let key = hash_request(&request);
-        cache
-            .write(*key.as_bytes(), version_json.as_bytes())
-            .unwrap();
+        cache.write(key, version_json.as_bytes()).unwrap();
     }
 
-    // Insert which hashing algo we're using based on the selected features.
-    // If `xxhash` is enabled we're using xxhash3, otherwise blake3.
-    //
-    // Print a warning if we see an keys are in an unexpectd hash format.
-    if cfg!(feature = "xxhash") {
-        let _ = cache.write(b"xxhash", b"true");
-        if cache.read(b"blake3").unwrap().is_some() {
-            tracing::error!(
-                "Rpsee has detected that your DB is using blake3 while we're currently using xxhash! \
-                Please remove all cache entries and try again."
-            );
-            tracing::info!("If you believe this is an error, please open a pull request!");
-        }
+    let (algorithm, other) = if cfg!(feature = "blake3") {
+        ("blake3", "xxhash")
     } else {
-        let _ = cache.write(b"blake3", b"true");
-        if cache.read(b"xxhash").unwrap().is_some() {
-            tracing::error!(
-                "Rpsee has detected that your DB is using xxhash while we're currently using blake3! \
-                Please remove all cache entries and try again."
-            );
-            tracing::info!("If you believe this is an error, please open a pull request!");
-        }
+        ("xxhash", "blake3")
+    };
+    cache.write(algorithm.as_bytes(), b"true").unwrap();
+    if cache.read(other.as_bytes()).unwrap().is_some() {
+        tracing::warn!(
+            "Cache contains {other} keys; this build uses {algorithm}. \
+             Use --clear-cache to reclaim entries from the other hash algorithm."
+        );
     }
 }
 
@@ -66,14 +53,19 @@ mod tests {
         let cache = <sled::Db<{ crate::FANOUT }> as GenericDatabase>::open(&config).unwrap();
         setup_data(&cache, false);
 
+        let (algorithm, other) = if cfg!(feature = "blake3") {
+            (b"blake3", b"xxhash")
+        } else {
+            (b"xxhash", b"blake3")
+        };
+        assert_eq!(cache.read(algorithm).unwrap(), Some(b"true".to_vec()));
+        assert!(cache.read(other).unwrap().is_none());
+
         for method in ["rpsee_is_lb", "web3_clientVersion"] {
             let request = serde_json::json!({
                 "id": null, "jsonrpc": "2.0", "method": method, "params": [],
             });
-            let stored = cache
-                .read(*hash_request(&request).as_bytes())
-                .unwrap()
-                .unwrap();
+            let stored = cache.read(hash_request(&request)).unwrap().unwrap();
             let response: serde_json::Value = serde_json::from_slice(&stored).unwrap();
             assert_eq!(response["result"], format!("rpsee {VERSION_STR}"));
         }
